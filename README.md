@@ -12,14 +12,14 @@ music itself. It also tells the difference between silence and a paused source, 
 fades away when the music stops and comes back when it starts.
 
 ```
-Music.app ──▶ Loopback virtual device ──▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
-                                          (Swift, FFT)                              (jitter buffer)
+Music.app  ┐
+Spotify    ├─▶ Loopback virtual device ──▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
+any player ┘                               (Swift, FFT)                              (jitter buffer)
 ```
 
-> **Requires a virtual audio device** ([Loopback](https://rogueamoeba.com/loopback/),
-> or the free [BlackHole](https://github.com/ExistentialAudio/BlackHole)) plus a small
-> Swift daemon you build once, for the reasons in
-> [Why there is a daemon](#why-there-is-a-daemon). See [Setup](#setup).
+Any app that makes sound can feed it. The daemon taps the virtual device, not an
+application, so Music.app, Spotify and anything else are all supported by adding each
+as a source on that device (see [Setup](#setup)).
 
 ## A companion to the Music widget
 
@@ -31,9 +31,10 @@ widget pins itself directly beside the Music widget, bottom-aligned with it, so 
 pair reads as one unit (see [Placement](#placement)).
 
 Neither depends on the other. The Music widget works on its own, and this one only
-needs the audio daemon below, so you can run either alone. But the defaults here
-assume both, and the visualizer taps the same Apple Music playback the Music widget
-reports on.
+needs the audio daemon below, so you can run either alone. They do line up well
+though: the Music widget reads now-playing from Apple Music or Spotify, and this one
+visualizes whichever of them you route into the virtual device, so pointing both at
+the same players gives you the track and its spectrum side by side.
 
 ## Why there is a daemon
 
@@ -53,13 +54,29 @@ it sidesteps the problem entirely. The widget never touches audio; it only draws
 
 Create a virtual device in [Loopback](https://rogueamoeba.com/loopback/) (or
 [BlackHole](https://github.com/ExistentialAudio/BlackHole), which is free) and add
-**Music.app as a source**. Adding the app as a source is better than changing your
-system output device, because only that app's audio is captured.
+your music app **as a source**. Adding the app as a source is better than changing
+your system output device, because only that app's audio is captured.
+
+**Any app works, and you can add more than one.** The daemon analyses whatever
+reaches the virtual device and neither knows nor cares which app produced it, so
+**Music.app and Spotify.app are both supported** simply by adding each as a source on
+the same device. The same goes for any other player you use, browser audio included.
+With several sources on one device you get a visualizer that responds to whichever
+one is playing, with no daemon restart and no configuration change here.
+
+This pairs with [the Music widget](https://github.com/dionmunk/uebersicht-music),
+which reads now-playing from Apple Music or Spotify: add both apps as sources and
+the two widgets cover the same players.
 
 > **Important: add a monitor.** A Loopback device with no monitor swallows the audio,
 > and you will stop hearing your music. In Loopback, add your real output (speakers,
 > headphones, display) under **Monitors** for that device. This is a Loopback
 > configuration step, not something the daemon controls.
+
+> **BlackHole routes differently.** It has no per-app sources or monitors: you send
+> an app's output to the BlackHole device, then use a **Multi-Output Device** in Audio
+> MIDI Setup (BlackHole plus your real output) so you still hear it. Loopback's
+> per-app sources are the easier route if you want several apps feeding one device.
 
 ### 2. Build the daemon
 
@@ -86,6 +103,12 @@ directory that goes invalid whenever anything else in there changes.
 ```sh
 ./lib/visualizerd --device "Music"
 ```
+
+`--device` names the **virtual device** from step 1, not an app. `"Music"` is just
+what the device happens to be called here; if you named yours `Loopback Audio` or
+`BlackHole 2ch`, pass that instead. Matching is case-insensitive, exact first and
+then substring, so `--device "Loopback"` finds `Loopback Audio`. Step 3 lists the
+names available.
 
 Approve the microphone prompt the first time. To start it automatically at login:
 
@@ -201,9 +224,10 @@ Optional, and driven by
 Nothing here requires it: every token is read with the widget's own value as the
 fallback, so the analyzer looks right on its own.
 
-The panel, text and status message read the shared tokens (`--panel-bg`,
-`--panel-blur`, `--text`, `--text-secondary`), so the widget's *chrome* follows the
-theme under any `colorScheme`. `theme` and `monochrome` extend that to the bars.
+The panel, text and status message have always read the shared tokens
+(`--panel-bg`, `--panel-blur`, `--text`, `--text-secondary`), so the widget's
+*chrome* follows the theme under any `colorScheme`. `theme` and `monochrome` extend
+that to the bars themselves.
 
 **`theme`** builds its ramp from the four data-series roles the theme controller
 publishes, `--series-primary` through `--series-quaternary`. Every colour scheme maps
@@ -298,7 +322,8 @@ Daemon options:
 ```
 --list                  list input-capable devices
 --selftest              push a synthetic 1 kHz tone through the analyzer
---device <name>         device to tap (default: Music)
+--device <name>         virtual input device to tap, not an app name; matched
+                        case-insensitively, exact then substring (default: Music)
 --port <n>              WebSocket port (default: 41500)
 --fft <n>               FFT window, power of two (default: 2048)
 --bands <n>             frequency bands (default: 75, the classic band count)
@@ -365,7 +390,7 @@ sleep again ten times a second for a paused source.
 | Symptom | Check |
 |---|---|
 | Panel says `no audio daemon` | Is the daemon running? `lsof -nP -iTCP:41500 -sTCP:LISTEN` |
-| Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the device is receiving silence, so the Loopback source is wrong |
+| Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the device is receiving silence, so the virtual device is not getting that app's audio. Check the app you are playing from is actually one of the device's sources: adding Music.app does nothing for Spotify, and vice versa |
 | You cannot hear your music | Loopback has a per-source **"Mute when captured"** option; turn it off. Also confirm the device has a Monitor pointing at your real output (step 1) |
 | Widget invisible but connected | `layout-controller.widget` is positioning it; see [Placement](#placement) |
 | Suspect the DSP | `./lib/visualizerd --selftest` renders a 1 kHz tone and asserts it lands in the right band |
