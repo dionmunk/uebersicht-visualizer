@@ -1,0 +1,808 @@
+// visualizerd — audio spectrum daemon for the Übersicht visualizer widget.
+//
+// Author:  Dion Munk <dion@dionmunk.com>
+// Source:  https://github.com/dionmunk/uebersicht-visualizer
+// License: Creative Commons Attribution-NonCommercial 4.0 International
+//          (CC BY-NC 4.0). See LICENSE at the repository root.
+//
+// Taps a CoreAudio *input* device (normally a Loopback/BlackHole virtual device
+// fed by Music.app), runs an FFT over the samples, and broadcasts normalized
+// band levels as JSON over a loopback-only WebSocket. The widget just draws.
+//
+// This exists because Übersicht's WebKit view cannot call getUserMedia: the app
+// bundle carries no NSMicrophoneUsageDescription and does not implement the
+// WKUIDelegate capture-permission callback. A separate binary gets its own TCC
+// grant and sidesteps both problems.
+//
+//   visualizerd --list                 # show input-capable devices
+//   visualizerd --device "Loopback Audio" --port 41417 --bands 32
+//
+// The audio engine only runs while at least one WebSocket client is connected,
+// so a hidden or unloaded widget costs nothing.
+
+import Foundation
+import AVFoundation
+import Accelerate
+import Network
+import CoreAudio
+
+// MARK: - Configuration
+
+struct Config {
+    var deviceName = "Music"
+    // 41416 is Übersicht's HTTP server and 41417 is its widget-push socket, so
+    // this deliberately sits clear of that pair.
+    var port: UInt16 = 41500
+    // 75 is the classic Winamp analyzer's band count; its "thick" mode groups these
+    // in fours to get 19 bars. The widget can resample to any count, but running the
+    // real number here means thin mode shows genuine resolution rather than
+    // interpolated filler.
+    var bandCount = 75
+    var fftSize = 2048
+    var minHz: Float = 32
+    var maxHz: Float = 16_000
+    // Normalization window. Anything at or below floorDb reads as silence, at or
+    // above ceilDb reads as full scale. Measured against real playback, per-band
+    // peaks span roughly -57..-17 dB, so this window keeps peaks near full scale
+    // without pinning the whole display to the ceiling.
+    var floorDb: Float = -72
+    var ceilDb: Float = -12
+    // Broadband RMS lives ~50 dB above individual bin peaks, so reusing the band
+    // window pins it at ~0.9 on anything loud and makes it useless as a signal.
+    var rmsFloorDb: Float = -60
+    var rmsCeilDb: Float = -6
+    // Music carries far less energy up top, so without a tilt the right-hand side
+    // of the display barely moves. Applied in dB, ramped 0 -> tiltDb across bands.
+    // 16 dB was picked against real playback at 75 bands: at 9 dB everything above
+    // the bass sat in the bottom row and only the left third of the display moved.
+    var tiltDb: Float = 16
+    // NOTE: there is deliberately no buffer-size knob here. AVAudioEngine's input
+    // tap coalesces to ~100 ms on macOS regardless of what the device is set to
+    // (verified against both Loopback and real hardware), so setting
+    // kAudioDevicePropertyBufferFrameSize bought nothing measurable while
+    // mutating a device other apps are playing through, which interrupted
+    // playback. The frame rate is recovered in the analyzer instead, by emitting
+    // every hop inside each buffer rather than one frame per callback.
+    // Smoothing defaults to off (1.0 = pass the measured value straight through).
+    // Bar ballistics belong to the renderer, not here: the widget models the classic
+    // analyzer's instant attack + linear falloff, and a second exponential decay at
+    // this layer would blunt exactly the snap that look depends on. Lower these only
+    // if you want a softer display fed to every client.
+    var attack: Float = 1.0    // per-frame rise coefficient (1 = instant)
+    var decay: Float = 1.0     // per-frame fall coefficient (1 = no tail)
+    var listOnly = false
+    var selfTest = false
+    var verbose = false
+}
+
+/// Log-spaced band edges in Hz. Shared by the analyzer and by --selftest so the
+/// test reports the same bands the daemon actually broadcasts.
+func bandEdgesHz(_ cfg: Config, sampleRate: Float) -> [(lo: Float, hi: Float)] {
+    // Written out longhand with explicit types: as a single tuple-returning map
+    // closure this defeats Swift's type checker.
+    let binHz: Float = sampleRate / Float(cfg.fftSize)
+    let top: Float = min(cfg.maxHz, sampleRate / 2 - binHz)
+    let ratio: Float = top / cfg.minHz
+    let n: Float = Float(cfg.bandCount)
+
+    var edges: [(lo: Float, hi: Float)] = []
+    edges.reserveCapacity(cfg.bandCount)
+    for b in 0..<cfg.bandCount {
+        let t0: Float = Float(b) / n
+        let t1: Float = Float(b + 1) / n
+        let f0: Float = cfg.minHz * pow(ratio, t0)
+        let f1: Float = cfg.minHz * pow(ratio, t1)
+        edges.append((lo: f0, hi: f1))
+    }
+    return edges
+}
+
+func parseArgs() -> Config {
+    var c = Config()
+    var it = CommandLine.arguments.dropFirst().makeIterator()
+    while let a = it.next() {
+        switch a {
+        case "--list", "-l":
+            c.listOnly = true
+        case "--selftest":
+            c.selfTest = true
+        case "--verbose", "-v":
+            c.verbose = true
+        case "--device", "-d":
+            if let v = it.next() { c.deviceName = v }
+        case "--port", "-p":
+            if let v = it.next(), let n = UInt16(v) { c.port = n }
+        case "--bands", "-b":
+            if let v = it.next(), let n = Int(v) { c.bandCount = max(4, min(128, n)) }
+        case "--fft":
+            // must stay a power of two for vDSP_fft_zrip
+            if let v = it.next(), let n = Int(v), n > 0, (n & (n - 1)) == 0 { c.fftSize = n }
+        case "--floor":
+            if let v = it.next(), let n = Float(v) { c.floorDb = n }
+        case "--ceil":
+            if let v = it.next(), let n = Float(v) { c.ceilDb = n }
+        case "--tilt":
+            if let v = it.next(), let n = Float(v) { c.tiltDb = n }
+        case "--attack":
+            if let v = it.next(), let n = Float(v) { c.attack = max(0.01, min(1, n)) }
+        case "--decay":
+            if let v = it.next(), let n = Float(v) { c.decay = max(0.01, min(1, n)) }
+        case "--help", "-h":
+            print("""
+            visualizerd — audio spectrum daemon
+
+              --list, -l              list input-capable audio devices and exit
+              --selftest              push a synthetic tone through the analyzer
+                                      and print the result (no device, no TCC)
+              --device, -d <name>     input device to tap (default: Music)
+              --port, -p <n>          WebSocket port (default: 41500)
+              --bands, -b <n>         number of frequency bands (default: 32)
+              --fft <n>               FFT window, power of two (default: 2048)
+              --floor <dB>            level mapped to 0 (default: -72)
+              --ceil <dB>             level mapped to 1 (default: -12)
+              --tilt <dB>             high-frequency lift across bands (default: 9)
+              --attack <0..1>         rise smoothing (default: 0.65)
+              --decay <0..1>          fall smoothing (default: 0.14)
+            """)
+            exit(0)
+        default:
+            break
+        }
+    }
+    return c
+}
+
+// MARK: - CoreAudio device enumeration
+
+struct Device {
+    let id: AudioDeviceID
+    let name: String
+    let channels: Int
+}
+
+private func deviceString(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+    var addr = AudioObjectPropertyAddress(mSelector: selector,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size = UInt32(MemoryLayout<CFString?>.size)
+    var value: CFString? = nil
+    let status = withUnsafeMutablePointer(to: &value) {
+        AudioObjectGetPropertyData(id, &addr, 0, nil, &size, $0)
+    }
+    guard status == noErr, let s = value else { return nil }
+    return s as String
+}
+
+private func inputChannelCount(_ id: AudioDeviceID) -> Int {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,
+                                          mScope: kAudioDevicePropertyScopeInput,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size),
+                                               alignment: MemoryLayout<AudioBufferList>.alignment)
+    defer { raw.deallocate() }
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, raw) == noErr else { return 0 }
+    let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+    return list.reduce(0) { $0 + Int($1.mNumberChannels) }
+}
+
+func inputDevices() -> [Device] {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.compactMap { id in
+        let ch = inputChannelCount(id)
+        guard ch > 0, let name = deviceString(id, kAudioObjectPropertyName) else { return nil }
+        return Device(id: id, name: name, channels: ch)
+    }
+}
+
+/// Exact (case-insensitive) match wins; otherwise fall back to a substring match
+/// so "Loopback" finds "Loopback Audio".
+func findDevice(named wanted: String) -> Device? {
+    let devices = inputDevices()
+    let needle = wanted.lowercased()
+    if let exact = devices.first(where: { $0.name.lowercased() == needle }) { return exact }
+    return devices.first(where: { $0.name.lowercased().contains(needle) })
+}
+
+// MARK: - Spectrum analyzer
+
+struct SpectrumFrame {
+    let bands: [Float]
+    let rms: Float
+}
+
+final class Analyzer {
+    private let cfg: Config
+    private let fftSize: Int
+    private let half: Int
+    private let hop: Int
+    private let log2n: vDSP_Length
+    private let setup: FFTSetup
+
+    private let ring: UnsafeMutablePointer<Float>
+    private let work: UnsafeMutablePointer<Float>
+    private let windowed: UnsafeMutablePointer<Float>
+    private let realp: UnsafeMutablePointer<Float>
+    private let imagp: UnsafeMutablePointer<Float>
+    private var window: [Float]
+    // Deliberately a raw pointer, not [Float]: the per-band peak below needs a
+    // pointer *into* the buffer, and `&array[i]` yields a pointer to a temporary
+    // holding a single element, so vDSP would read past it.
+    private let mags: UnsafeMutablePointer<Float>
+
+    private var ringPos = 0
+    private var filled = 0
+    private var sinceEmit = 0
+
+    private var bandBins: [(lo: Int, hi: Int)] = []
+    private var levels: [Float]
+    private var lastSampleRate: Float = 0
+
+    /// Broadband level (0..1), useful for a pulse/glow that tracks overall loudness.
+    private(set) var rms: Float = 0
+    /// Pre-normalization per-band dB, kept so --verbose can report what the real
+    /// signal looks like instead of what the clamped output looks like.
+    private(set) var rawDb: [Float]
+    /// Hop-boundary analyses performed, for rate diagnostics.
+    private(set) var analyses: Int = 0
+
+    init(config: Config) {
+        cfg = config
+        fftSize = config.fftSize
+        half = config.fftSize / 2
+        hop = max(256, config.fftSize / 4)   // ~86 fps at 48k with a 2048 window
+        log2n = vDSP_Length(log2(Double(config.fftSize)))
+        setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))!
+
+        ring = .allocate(capacity: fftSize)
+        work = .allocate(capacity: fftSize)
+        windowed = .allocate(capacity: fftSize)
+        realp = .allocate(capacity: half)
+        imagp = .allocate(capacity: half)
+        ring.initialize(repeating: 0, count: fftSize)
+        work.initialize(repeating: 0, count: fftSize)
+        windowed.initialize(repeating: 0, count: fftSize)
+        realp.initialize(repeating: 0, count: half)
+        imagp.initialize(repeating: 0, count: half)
+
+        window = [Float](repeating: 0, count: fftSize)
+        vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_DENORM))
+        mags = .allocate(capacity: half)
+        mags.initialize(repeating: 0, count: half)
+        levels = [Float](repeating: 0, count: config.bandCount)
+        rawDb = [Float](repeating: -120, count: config.bandCount)
+    }
+
+    deinit {
+        vDSP_destroy_fftsetup(setup)
+        ring.deallocate(); work.deallocate(); windowed.deallocate()
+        realp.deallocate(); imagp.deallocate(); mags.deallocate()
+    }
+
+    /// Log-spaced band edges. Recomputed whenever the device's sample rate changes.
+    private func rebuildBands(sampleRate: Float) {
+        let binHz = sampleRate / Float(fftSize)
+        bandBins = bandEdgesHz(cfg, sampleRate: sampleRate).map { edge in
+            var lo = Int(edge.lo / binHz)
+            var hi = Int(edge.hi / binHz)
+            lo = max(1, min(lo, half - 1))
+            hi = max(lo + 1, min(hi, half))
+            return (lo, hi)
+        }
+    }
+
+    /// Nominal spacing between emitted frames, in milliseconds.
+    var frameIntervalMs: Float {
+        lastSampleRate > 0 ? Float(hop) / lastSampleRate * 1000 : 0
+    }
+
+    /// Feed mono samples. Returns every frame produced by this buffer.
+    ///
+    /// AVAudioEngine's input tap hands us ~100 ms at a time on macOS no matter what
+    /// buffer size we request, so a single frame per callback would mean analyzing
+    /// one 42 ms window out of every 100 ms and dropping the rest — transients in
+    /// the gap would simply never appear. Instead we step the whole buffer at hop
+    /// resolution and return the lot; the client plays them back on a jitter buffer.
+    func feed(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Float) -> [SpectrumFrame] {
+        if sampleRate != lastSampleRate, sampleRate > 0 {
+            lastSampleRate = sampleRate
+            rebuildBands(sampleRate: sampleRate)
+        }
+        guard !bandBins.isEmpty else { return [] }
+
+        var out: [SpectrumFrame] = []
+        var i = 0
+        while i < count {
+            // Bound each copy by both the ring wrap and the next hop boundary, so
+            // analysis lands exactly on hop multiples.
+            let toWrap = fftSize - ringPos
+            let toHop = max(1, hop - sinceEmit)
+            let chunk = min(count - i, toWrap, toHop)
+
+            (ring + ringPos).update(from: samples + i, count: chunk)
+            ringPos = (ringPos + chunk) % fftSize
+            filled = min(filled + chunk, fftSize)
+            sinceEmit += chunk
+            i += chunk
+
+            if filled >= fftSize && sinceEmit >= hop {
+                sinceEmit = 0
+                out.append(analyze())
+            }
+        }
+        return out
+    }
+
+    private func analyze() -> SpectrumFrame {
+        analyses += 1
+        // Linearize the ring: oldest sample sits at ringPos.
+        let tail = fftSize - ringPos
+        work.update(from: ring + ringPos, count: tail)
+        (work + tail).update(from: ring, count: ringPos)
+
+        var sumSq: Float = 0
+        vDSP_measqv(work, 1, &sumSq, vDSP_Length(fftSize))
+        let frameRms = sqrt(sumSq)
+        let rmsDb = 20 * log10(frameRms + 1e-9)
+        rms = clamp01((rmsDb - cfg.rmsFloorDb) / (cfg.rmsCeilDb - cfg.rmsFloorDb))
+
+        vDSP_vmul(work, 1, window, 1, windowed, 1, vDSP_Length(fftSize))
+
+        var split = DSPSplitComplex(realp: realp, imagp: imagp)
+        windowed.withMemoryRebound(to: DSPComplex.self, capacity: half) { ptr in
+            vDSP_ctoz(ptr, 2, &split, 1, vDSP_Length(half))
+        }
+        vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+        vDSP_zvabs(&split, 1, mags, 1, vDSP_Length(half))
+
+        // vDSP_fft_zrip returns values scaled by 2; the Hann window costs another
+        // factor of 2 in coherent gain. Fold both in so dB numbers are meaningful.
+        var scale = Float(2.0) / Float(fftSize)
+        vDSP_vsmul(mags, 1, &scale, mags, 1, vDSP_Length(half))
+
+        for (b, bin) in bandBins.enumerated() {
+            // Peak within the band tracks transients better than a mean, which
+            // washes out as the upper bands get wider.
+            var peak: Float = 0
+            vDSP_maxv(mags + bin.lo, 1, &peak, vDSP_Length(bin.hi - bin.lo))
+            let db = 20 * log10(peak + 1e-9)
+            rawDb[b] = db
+            // Tilt in dB rather than scaling the normalized value: a multiplier
+            // on an already-clamped 0..1 just crushes everything into the ceiling.
+            let tilt = cfg.tiltDb * (Float(b) / Float(max(1, cfg.bandCount - 1)))
+            let target = clamp01((db + tilt - cfg.floorDb) / (cfg.ceilDb - cfg.floorDb))
+
+            let coeff = target > levels[b] ? cfg.attack : cfg.decay
+            levels[b] += (target - levels[b]) * coeff
+        }
+        return SpectrumFrame(bands: levels, rms: rms)
+    }
+
+    private func clamp01(_ v: Float) -> Float { min(max(v, 0), 1) }
+}
+
+// MARK: - WebSocket server (loopback only)
+
+final class WSServer {
+    private let queue = DispatchQueue(label: "visualizerd.ws")
+    private var listener: NWListener?
+    private var clients: [ObjectIdentifier: Client] = [:]
+
+    /// Called on the server queue whenever the client count changes.
+    var onClientCountChanged: ((Int) -> Void)?
+    /// Sent to each client immediately on connect.
+    var greeting: (() -> Data?)?
+    /// Called once the listener is actually bound, not merely created.
+    var onReady: (() -> Void)?
+
+    private final class Client {
+        let conn: NWConnection
+        var inFlight = 0
+        init(_ conn: NWConnection) { self.conn = conn }
+    }
+
+    func start(port: UInt16) throws {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        // Bind to loopback explicitly: this stream is desktop audio, it has no
+        // business being reachable from the network.
+        params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback),
+                                                 port: NWEndpoint.Port(rawValue: port)!)
+        let ws = NWProtocolWebSocket.Options()
+        ws.autoReplyPing = true
+        params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
+
+        let l = try NWListener(using: params)
+        l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.onReady?()
+            case .failed(let e):
+                FileHandle.standardError.write("visualizerd: listener failed: \(e)\n".data(using: .utf8)!)
+                exit(1)
+            default:
+                break
+            }
+        }
+        l.start(queue: queue)
+        listener = l
+    }
+
+    private func accept(_ conn: NWConnection) {
+        let client = Client(conn)
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.queue.async {
+                    self.clients[ObjectIdentifier(client)] = client
+                    self.onClientCountChanged?(self.clients.count)
+                    if let hello = self.greeting?() { self.send(hello, to: client) }
+                }
+                self.receive(client)
+            case .failed, .cancelled:
+                self.remove(client)
+            default:
+                break
+            }
+        }
+        conn.start(queue: queue)
+    }
+
+    private func receive(_ client: Client) {
+        client.conn.receiveMessage { [weak self] _, context, _, error in
+            guard let self else { return }
+            if error != nil {
+                self.remove(client)
+                return
+            }
+            if let meta = context?.protocolMetadata.first as? NWProtocolWebSocket.Metadata,
+               meta.opcode == .close {
+                client.conn.cancel()
+                self.remove(client)
+                return
+            }
+            self.receive(client)   // we never act on inbound frames, just stay open
+        }
+    }
+
+    private func remove(_ client: Client) {
+        queue.async {
+            if self.clients.removeValue(forKey: ObjectIdentifier(client)) != nil {
+                self.onClientCountChanged?(self.clients.count)
+            }
+        }
+    }
+
+    private func send(_ data: Data, to client: Client) {
+        // Drop frames for a client that is not keeping up rather than queueing
+        // audio-rate messages without bound.
+        guard client.inFlight < 3 else { return }
+        client.inFlight += 1
+        let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+        let ctx = NWConnection.ContentContext(identifier: "frame", metadata: [meta])
+        client.conn.send(content: data, contentContext: ctx, isComplete: true,
+                         completion: .contentProcessed { [weak self] _ in
+            self?.queue.async { client.inFlight -= 1 }
+        })
+    }
+
+    func broadcast(_ data: Data) {
+        queue.async {
+            for client in self.clients.values { self.send(data, to: client) }
+        }
+    }
+
+    var clientCount: Int {
+        queue.sync { clients.count }
+    }
+}
+
+// MARK: - Capture
+
+final class Capture {
+    private var engine: AVAudioEngine?
+    private var monoBuf: UnsafeMutablePointer<Float>
+    private var monoCap: Int
+    private(set) var isRunning = false
+
+    init() {
+        monoCap = 16384
+        monoBuf = .allocate(capacity: monoCap)
+        monoBuf.initialize(repeating: 0, count: monoCap)
+    }
+
+    deinit { monoBuf.deallocate() }
+
+    /// Frames delivered by the tap so far, and the size of the last buffer.
+    private(set) var tapCallbacks = 0
+    private(set) var lastFrameLength = 0
+    var verbose = false
+
+    func start(device: Device,
+               onSamples: @escaping (UnsafePointer<Float>, Int, Float) -> Void) throws {
+        guard !isRunning else { return }
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+
+        guard let unit = input.audioUnit else {
+            throw NSError(domain: "visualizerd", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "input node has no audio unit"])
+        }
+        var deviceID = device.id
+        let status = AudioUnitSetProperty(unit,
+                                          kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0,
+                                          &deviceID,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else {
+            throw NSError(domain: "visualizerd", code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "could not select device '\(device.name)' (OSStatus \(status))"])
+        }
+
+        // Nothing here reconfigures the device. It is shared with whatever is
+        // playing through it, and this process is only a listener.
+        let format = input.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw NSError(domain: "visualizerd", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "device '\(device.name)' reported an empty input format"])
+        }
+
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            guard let self, let channels = buffer.floatChannelData else { return }
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { return }
+            if frames > self.monoCap { self.grow(to: frames) }
+            if self.verbose && self.tapCallbacks == 0 {
+                FileHandle.standardError.write("""
+                visualizerd: first tap buffer — \(frames) frames, \
+                \(Int(buffer.format.sampleRate)) Hz, \(buffer.format.channelCount) ch \
+                (implies ~\(String(format: "%.1f", buffer.format.sampleRate / Double(frames))) callbacks/sec)
+
+                """.data(using: .utf8)!)
+            }
+            self.tapCallbacks += 1
+            self.lastFrameLength = frames
+
+            let channelCount = Int(buffer.format.channelCount)
+            if channelCount == 1 {
+                self.monoBuf.update(from: channels[0], count: frames)
+            } else {
+                vDSP_vadd(channels[0], 1, channels[1], 1, self.monoBuf, 1, vDSP_Length(frames))
+                var half: Float = 0.5
+                vDSP_vsmul(self.monoBuf, 1, &half, self.monoBuf, 1, vDSP_Length(frames))
+            }
+            onSamples(self.monoBuf, frames, Float(buffer.format.sampleRate))
+        }
+
+        engine.prepare()
+        try engine.start()
+        self.engine = engine
+        isRunning = true
+    }
+
+    func stop() {
+        guard let engine, isRunning else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        self.engine = nil
+        isRunning = false
+    }
+
+    private func grow(to frames: Int) {
+        monoBuf.deallocate()
+        monoCap = frames * 2
+        monoBuf = .allocate(capacity: monoCap)
+        monoBuf.initialize(repeating: 0, count: monoCap)
+    }
+}
+
+// MARK: - Main
+
+let config = parseArgs()
+
+if config.listOnly {
+    let devices = inputDevices()
+    if devices.isEmpty {
+        print("No input-capable audio devices found.")
+    } else {
+        print("Input-capable audio devices:")
+        for d in devices {
+            print(String(format: "  %-32s %d ch", (d.name as NSString).utf8String!, d.channels))
+        }
+    }
+    exit(0)
+}
+
+if config.selfTest {
+    // Drives the exact analyzer the daemon uses with a known signal, so a silent
+    // display can be attributed to routing rather than to the DSP.
+    let sampleRate: Float = 48_000
+    let toneHz: Float = 1_000
+    let amplitude: Float = 0.1          // -20 dBFS
+    let chunk = 1024
+
+    let analyzer = Analyzer(config: config)
+    let buf = UnsafeMutablePointer<Float>.allocate(capacity: chunk)
+    defer { buf.deallocate() }
+
+    var phase: Float = 0
+    var levels: [Float] = []
+    let step = 2 * Float.pi * toneHz / sampleRate
+    for _ in 0..<(Int(sampleRate) / chunk) {   // ~1 second, enough for smoothing to settle
+        for i in 0..<chunk {
+            buf[i] = amplitude * sin(phase)
+            phase += step
+            if phase > 2 * .pi { phase -= 2 * .pi }
+        }
+        if let last = analyzer.feed(buf, count: chunk, sampleRate: sampleRate).last {
+            levels = last.bands
+        }
+    }
+
+    guard !levels.isEmpty else {
+        print("selftest FAILED: analyzer produced no output")
+        exit(1)
+    }
+
+    let edges = bandEdgesHz(config, sampleRate: sampleRate)
+    let ramp = Array(" .:-=+*#%@")
+    print("selftest: \(Int(toneHz)) Hz sine at -20 dBFS, \(config.bandCount) bands\n")
+    for (i, v) in levels.enumerated() {
+        let filled = Int(v * 40)
+        let bar = String(repeating: "#", count: filled)
+        print(String(format: "  %2d  %6.0f-%-6.0f Hz  %.3f  %@",
+                     i, edges[i].lo, edges[i].hi, v, bar))
+    }
+    let peak = levels.enumerated().max(by: { $0.element < $1.element })!
+    let inBand = toneHz >= edges[peak.offset].lo && toneHz <= edges[peak.offset].hi
+    print("\n  compact: " + levels.map { String(ramp[Int(min(0.999, $0) * 10)]) }.joined())
+    print("  rms: \(String(format: "%.3f", analyzer.rms))")
+    print("  peak band: \(peak.offset) "
+          + "(\(Int(edges[peak.offset].lo))-\(Int(edges[peak.offset].hi)) Hz) "
+          + "level \(String(format: "%.3f", peak.element))")
+    print(inBand
+          ? "\n  PASS: the tone landed in the band that contains \(Int(toneHz)) Hz"
+          : "\n  FAIL: peak band does not contain \(Int(toneHz)) Hz")
+    exit(inBand ? 0 : 1)
+}
+
+guard let device = findDevice(named: config.deviceName) else {
+    let available = inputDevices().map { "  \($0.name)" }.joined(separator: "\n")
+    FileHandle.standardError.write("""
+    visualizerd: no input device matching '\(config.deviceName)'.
+
+    Available:
+    \(available.isEmpty ? "  (none)" : available)
+
+    Route Music.app's output to a virtual device (Loopback / BlackHole) and pass
+    its name with --device.
+
+    """.data(using: .utf8)!)
+    exit(2)
+}
+
+let analyzer = Analyzer(config: config)
+let capture = Capture()
+let server = WSServer()
+var verboseTimer: DispatchSourceTimer?
+
+// Preformatted so the hot path only concatenates a handful of small strings.
+server.greeting = {
+    let dt = analyzer.frameIntervalMs
+    let payload = """
+    {"type":"meta","device":\(jsonString(device.name)),\
+    "bands":\(config.bandCount),"fft":\(config.fftSize),\
+    "minHz":\(Int(config.minHz)),"maxHz":\(Int(config.maxHz)),\
+    "dt":\(String(format: "%.2f", dt > 0 ? dt : 10.67))}
+    """
+    return payload.data(using: .utf8)
+}
+
+func jsonString(_ s: String) -> String {
+    let escaped = s
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    return "\"\(escaped)\""
+}
+
+/// A batch of frames plus the nominal spacing between them, so the client can pace
+/// playback rather than dumping the whole burst into one repaint. Levels go out as
+/// 0-255 integers; the widget cannot resolve more precision than that anyway.
+func encode(frames: [SpectrumFrame], dtMs: Float) -> Data {
+    var s = "{\"type\":\"f\",\"dt\":\(String(format: "%.2f", dtMs)),\"f\":["
+    s.reserveCapacity(frames.count * (frames.first?.bands.count ?? 32) * 4 + 64)
+    for (i, frame) in frames.enumerated() {
+        if i > 0 { s += "," }
+        s += "["
+        for (j, v) in frame.bands.enumerated() {
+            if j > 0 { s += "," }
+            s += String(Int(min(max(v, 0), 1) * 255))
+        }
+        s += "]"
+    }
+    s += "],\"r\":["
+    for (i, frame) in frames.enumerated() {
+        if i > 0 { s += "," }
+        s += String(Int(min(max(frame.rms, 0), 1) * 255))
+    }
+    s += "]}"
+    return s.data(using: .utf8) ?? Data()
+}
+
+server.onClientCountChanged = { count in
+    // Battery guard: no viewers, no capture. A hidden widget costs nothing.
+    if count > 0 && !capture.isRunning {
+        do {
+            try capture.start(device: device) { samples, frames, rate in
+                let batch = analyzer.feed(samples, count: frames, sampleRate: rate)
+                if !batch.isEmpty {
+                    server.broadcast(encode(frames: batch, dtMs: analyzer.frameIntervalMs))
+                }
+            }
+            FileHandle.standardError.write("visualizerd: capture started (\(device.name))\n".data(using: .utf8)!)
+        } catch {
+            FileHandle.standardError.write("visualizerd: capture failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+        }
+    } else if count == 0 && capture.isRunning {
+        capture.stop()
+        FileHandle.standardError.write("visualizerd: capture stopped (no clients)\n".data(using: .utf8)!)
+    }
+}
+
+server.onReady = {
+    FileHandle.standardError.write("""
+    visualizerd: listening on ws://127.0.0.1:\(config.port)
+    visualizerd: device '\(device.name)' (\(device.channels) ch), \(config.bandCount) bands
+    visualizerd: idle until a client connects
+
+    """.data(using: .utf8)!)
+}
+
+do {
+    try server.start(port: config.port)
+} catch {
+    FileHandle.standardError.write("visualizerd: could not listen on port \(config.port): \(error)\n".data(using: .utf8)!)
+    exit(1)
+}
+
+if config.verbose {
+    capture.verbose = true
+    var lastAnalyses = 0
+    var lastCallbacks = 0
+    let timer = DispatchSource.makeTimerSource(queue: .global())
+    timer.schedule(deadline: .now() + 2, repeating: 2)
+    timer.setEventHandler {
+        guard capture.isRunning else { return }
+        let a = analyzer.analyses, c = capture.tapCallbacks
+        let da = Double(a - lastAnalyses) / 2.0
+        let dc = Double(c - lastCallbacks) / 2.0
+        lastAnalyses = a; lastCallbacks = c
+
+        let db = analyzer.rawDb
+        let lo = db.min() ?? 0, hi = db.max() ?? 0
+        let mean = db.reduce(0, +) / Float(max(1, db.count))
+        FileHandle.standardError.write(String(
+            format: "visualizerd: %.1f tap/s, %.1f fft/s, buf %d | raw dB min %.1f mean %.1f max %.1f\n",
+            dc, da, capture.lastFrameLength, lo, mean, hi).data(using: .utf8)!)
+    }
+    timer.resume()
+    // Keep the source alive for the process lifetime.
+    verboseTimer = timer
+}
+
+signal(SIGINT) { _ in exit(0) }
+signal(SIGTERM) { _ in exit(0) }
+
+RunLoop.main.run()

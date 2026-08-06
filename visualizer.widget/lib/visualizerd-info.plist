@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.uebersicht.visualizerd</string>
+	<key>CFBundleName</key>
+	<string>visualizerd</string>
+	<key>CFBundleExecutable</key>
+	<string>visualizerd</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSBackgroundOnly</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<!-- Required. Without this key macOS terminates the process the moment it
+	     touches an audio input device, which is exactly why the widget itself
+	     cannot do this work: Übersicht.app ships no microphone usage string. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The Übersicht visualizer widget reads the audio loopback device to draw a spectrum of what is currently playing.</string>
+</dict>
+</plist>

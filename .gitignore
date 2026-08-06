@@ -1,0 +1,29 @@
+# Xcode #
+#########
+*.xcuserdata
+*.xcuserdatad/
+*.xcworkspace
+!default.xcworkspace
+*.pbxuser
+DerivedData
+build/
+*.ipa
+*.moved-aside
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+thumbs.db
+Thumbs.db
+
+# Compiled audio daemon. Built locally with ./lib/build.sh, which ad-hoc signs it
+# with a stable identifier so the microphone grant survives across runs. Deliberately
+# not shipped: a downloaded binary arrives quarantined and carries someone else's
+# signature, so it would fail its TCC grant rather than just work.
+visualizer.widget/lib/visualizerd

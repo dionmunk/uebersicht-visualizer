@@ -1,0 +1,6 @@
+{
+  "name": "Visualizer",
+  "description": "A real-time audio spectrum analyzer for Übersicht, recreating the classic Winamp visualizer and driven by whatever is actually playing.",
+  "author": "Dion Munk",
+  "email": "dion@dionmunk.com"
+}
