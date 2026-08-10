@@ -14,16 +14,21 @@ options =
   # How this widget gets positioned, if layout-controller.widget is installed.
   #
   #   "manual"  pin myself using the position options below, and tell the controller
-  #             to leave me alone (it reads `data-layout-manual` off the root
-  #             element). This is the default because the widget is a companion to
-  #             music.widget, which pins itself bottom left: the two are meant to
-  #             sit together, and packing this one into a column would separate them.
+  #             to leave me alone (it reads `data-layout-manual` off the root element).
   #   "managed" join the grid. The controller then packs and drags this widget like
   #             any other, and the position options below only decide where it sits
   #             until the controller places it.
   #
+  # "managed" is the default. It used to be "manual", because this widget is a
+  # companion to music.widget and both belong at the foot of the screen, while the
+  # controller only ever grew columns downward from the top: being managed meant being
+  # dragged up to join a stack, away from the widget it pairs with. The controller now
+  # anchors each widget to the screen edge it belongs to, and this one publishes
+  # `data-layout-anchor` from verticalPosition below, so it can be packed and dragged
+  # like anything else and still sit where it was written to sit.
+  #
   # With no controller installed the two behave identically.
-  layoutMode : "manual"                # manual | managed
+  layoutMode : "managed"               # manual | managed
 
   # Where the widget sits on your screen.
   verticalPosition : "bottom"          # top | bottom | center
@@ -229,6 +234,11 @@ options =
 # skin ships its own VISCOLOR.TXT in this format (24 lines: background, dots, 16
 # spectrum colours, 5 oscilloscope colours, peak); drop another skin's values in
 # here to reskin the analyzer.
+#
+# `dots` and `background` are transcribed for completeness but are not drawn: the
+# backdrop dots always take the theme's neutral instead (see buildPalette), and the
+# pane behind them is this collection's translucent panel unless `background` is set
+# to "classic". Only `spectrum` and `peak` come from a skin.
 VISCOLOR =
   spectrum: [
     '239,49,16'   # 0 — top
@@ -431,6 +441,13 @@ afterRender: (domEl) ->
   else
     domEl.setAttribute?('data-layout-manual', '')
 
+  # Which screen edge to stack from when the controller does manage this widget. It
+  # packs a column downward from the top by default, and this widget belongs at the
+  # foot of the screen beside music.widget, so it says so rather than opting out.
+  # Only a default: once the widget has been dragged, where it was dropped wins.
+  domEl.setAttribute? 'data-layout-anchor',
+    if options.verticalPosition is 'bottom' then 'bottom' else 'top'
+
   panel = domEl.querySelector('.panel')
   canvas = domEl.querySelector('.viz')
   return unless panel and canvas
@@ -543,8 +560,17 @@ afterRender: (domEl) ->
     steps = VISCOLOR.spectrum.length
     round = (n) -> Math.round(n * 1000) / 1000
 
+    # The backdrop dots are the one part of the palette that never takes a scheme's
+    # colours. They are structure rather than data, a faint neutral for the bars to
+    # read against, so they use the same --dot-grid value as every other widget in
+    # this collection (rgba(ink / .05), see THEME.md). VISCOLOR gives them a solid
+    # blue-grey, which was legible on Winamp's opaque black pane but on a translucent
+    # panel reads as a second colour competing with the ramp, so that value is
+    # deliberately ignored. Falls back to white ink with no theme-controller installed.
+    ink = readInk()
+    dots = fill(ink, .05)
+
     if options.colorScheme is 'monochrome'
-      ink = readInk()
       lo = Math.min(options.monoRange...)
       hi = Math.max(options.monoRange...)
       spectrum =
@@ -553,8 +579,8 @@ afterRender: (domEl) ->
           # mirroring the Winamp ramp's hot-to-cool ordering.
           fill(ink, round(hi + (lo - hi) * (i / (steps - 1))))
       # Peak markers sit above the bar tops, so they take the brightest step and
-      # stay the most solid thing on the panel. Dots match the --dot-grid neutral.
-      return { spectrum: spectrum, peak: fill(ink, round(hi)), dots: fill(ink, .05) }
+      # stay the most solid thing on the panel.
+      return { spectrum: spectrum, peak: fill(ink, round(hi)), dots: dots }
 
     if options.colorScheme is 'theme'
       # The four data-series roles are the theme system's own hot-to-cool ramp
@@ -567,17 +593,16 @@ afterRender: (domEl) ->
       ])
       stops = (s for s in stops when s)
       if stops.length >= 2
-        ink = readInk()
         return
           spectrum: rampFrom(stops, steps)
           peak: fill(ink, .8)
-          dots: fill(ink, .05)
+          dots: dots
       # No controller, or a theme that publishes no series roles: fall through to
       # the Winamp ramp rather than inventing colours.
 
     spectrum: (fill(c) for c in VISCOLOR.spectrum)
     peak: fill(VISCOLOR.peak)
-    dots: fill(VISCOLOR.dots)
+    dots: dots
 
   palette = ->
     state.palette ?= buildPalette()

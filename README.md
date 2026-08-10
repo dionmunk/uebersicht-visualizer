@@ -152,12 +152,20 @@ the display looks; the level mapping is independent of both.
 
 | Value | Behaviour |
 |---|---|
-| `manual` (default) | Pins itself with the position options and sets `data-layout-manual` on its root element, the controller's documented opt-out |
-| `managed` | Joins the grid. The controller packs and drags it like any other widget, and the position options only decide where it sits until then |
+| `manual` | Pins itself with the position options and sets `data-layout-manual` on its root element, the controller's documented opt-out |
+| `managed` (default) | Joins the grid. The controller packs and drags it like any other widget, and the position options only decide where it sits until then |
 
-`manual` is the default precisely because of the companion relationship: the Music
-widget pins itself bottom-left and is listed in the controller's own `offGrid` set,
-so letting this one get packed into a column would separate the pair.
+`manual` used to be the default, because of the companion relationship: this widget
+and the Music widget both belong at the foot of the screen, and the controller packed
+columns only downward from the top, so being managed meant being dragged up into a
+stack away from the widget it pairs with.
+
+The controller now anchors each widget to the screen edge it belongs to, so that
+reason is gone. This widget publishes `data-layout-anchor` from its `verticalPosition`
+option, which means it can be packed and dragged like anything else and still sit
+where it was written to sit, with no first drag needed to teach it. Anchoring needs
+layout-controller 2026-08-10 or newer; older versions ignore the attribute, in which
+case set `layoutMode: "manual"` to keep the old behaviour.
 
 The widget also *reads* the grid rather than restating it. Setting `width: "grid"`
 (the default) resolves to `var(--grid-col, 320px)`, and `height: "grid"` to
@@ -214,6 +222,11 @@ pane down to bottom), 18–22 oscilloscope, 23 peak marker. The defaults in
 `index.coffee` are the stock ramp. Paste any other skin's values into the `VISCOLOR`
 block to reskin it.
 
+Only the spectrum and the peak marker are taken from a skin. The backdrop dots and the
+pane behind them are transcribed for completeness but not drawn: the dots always use
+the theme's neutral (below) and the pane is this collection's translucent panel unless
+`background` is set to `classic`.
+
 **`theme`** and **`monochrome`** both follow `theme-controller.widget`. See
 [Theming](#theming) below.
 
@@ -239,8 +252,15 @@ opacity, so this scheme does the right thing there too.
 
 **`monochrome`** ignores hues entirely and uses the mode's ink at a stepped opacity:
 the 16 steps run from `monoRange[1]` at the top of the ramp down to `monoRange[0]` at
-the bottom (default `.3` → `1`). Peak markers take the top step, and the backdrop
-dots sit at `.05` to match `--dot-grid`.
+the bottom (default `.3` → `1`). Peak markers take the top step.
+
+**The backdrop dots are always neutral**, in every scheme including `winamp`: ink at
+`.05`, matching the `--dot-grid` token the rest of this collection uses. They are
+structure rather than data, something for the bars to read against. VISCOLOR gives
+them a solid blue-grey, which was legible on Winamp's opaque black pane but on a
+translucent panel reads as a second colour competing with the ramp. With no theme
+controller installed they fall back to white ink. Turn them off entirely with
+`grid: false`.
 
 Both resolve tokens with `getComputedStyle` on `:root` rather than through a
 stylesheet, because a canvas cannot inherit custom properties the way a styled
