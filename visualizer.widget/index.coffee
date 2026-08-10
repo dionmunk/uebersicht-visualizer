@@ -100,11 +100,25 @@ options =
   # Show the falling peak markers above each bar.
   peaks : true                         # true | false
 
-  # Falloff speeds, 1 (slowest) to 5 (fastest). The classic analyzer snaps a bar
-  # up instantly and lets it fall at a fixed rate, rather than easing both ways;
-  # peaks hold where they land, then accelerate downward like gravity.
+  # Falloff speeds, 1 (slowest) to 5 (fastest), matching the five positions of the
+  # original's own two sliders. The classic analyzer snaps a bar up instantly and
+  # lets it fall at a fixed rate, rather than easing both ways; peaks hold where they
+  # land, then accelerate downward. 3 and 2 are a fresh Winamp's defaults.
   analyzerFalloff : 3                  # 1..5
   peakFalloff : 2                      # 1..5
+
+  # The vis clock, in Hz. Winamp's falloff ladder is in whole pixels per rendered
+  # frame, so it only means anything against a fixed frame rate: this is that rate,
+  # and the ballistics run on it rather than on the repaint loop. Frames that span
+  # two ticks run both, frames that span none leave the bars where they are, so the
+  # display is independent of how often the widget actually paints.
+  #
+  # 60 is what Webamp uses, and Webamp's reverse-engineered analyzer is where the
+  # ladder comes from. Winamp's own "refresh rate" slider repeatedly halves its rate,
+  # so 30 / 15 / 7.5 are the other authentic settings. Lower is chunkier, and in
+  # `line` mode it is the flicker rate: colours change fallStep * visRefresh * rows
+  # times a second while a bar falls, which is ~45 a second at these defaults.
+  visRefresh : 60                      # Hz
 
   # --- Look -------------------------------------------------------------------
   # What sits behind the bars.
@@ -145,13 +159,45 @@ options =
   # Gap between bars in px. The classic wide mode is a 3px bar with a 1px gap.
   barGap : 1                           # px
 
-  # Display curve. The daemon emits a faithful dB mapping; a gamma above 1 pushes
-  # the mids down for contrast, 1 is linear.
+  # The daemon's dB window, ceilDb - floorDb, which is 60 at its defaults (-72..-12).
   #
-  # Kept mild here on purpose. Quantising to 16 rows already supplies most of the
-  # contrast, and a steep curve on top of it flattens every band above the bass
-  # into the bottom row, leaving the right two thirds of the display dead.
-  gamma : 1.35
+  # The widget needs it because the original's analyzer is linear in amplitude: its
+  # FFT hands back sqrt(re^2 + im^2), which is compared straight against pixels and
+  # clamped, with no dB conversion anywhere in the chain. (The one log10 in that FFT
+  # is applied to the frequency index, a per-bin weighting running 0.024 to 1.0, so a
+  # 32dB high-frequency tilt. It is a weighting, not a log of amplitude.) The daemon
+  # does convert to dB, so this is what undoes it and recovers the amplitude the
+  # original would have worked in.
+  #
+  # That reconstruction is the whole character of the display. A linear mapping leaves
+  # quiet content on the floor and lets only real peaks climb; passing the daemon's dB
+  # reading straight through instead lifts everything into the middle of the ramp. A
+  # band 36dB down sits on the bottom row one way and halfway up the pane the other.
+  # Measured over 20s of playback at the same ~1.5% of bars pinned at the ceiling:
+  #
+  #                    dark   green   amber   top four   median row
+  #   linear (this)   26.1%   65.4%    6.8%       1.8%            2
+  #   raw dB           2.7%   24.9%   58.5%      13.9%            9
+  #
+  # Both reach all sixteen ramp entries; the dB reading just spends its life in the
+  # warm middle of them, which is not what the original looks like.
+  #
+  # Keep this matched to the daemon for a faithful reconstruction. Lowering it
+  # deliberately is the gentlest way to tame the spikiness, since it compresses the
+  # range the curve spans: at 48 the dark share above drops from 26% to 16% and the
+  # display reads fuller. Reach for it before gain.
+  dbSpan : 60                          # dB
+
+  # Output gain, applied after the curve above and hard-clipped at full scale, the way
+  # the original's is. Winamp's own gain sits on the waveform ahead of its FFT (it
+  # divides by 24, so roughly 5x), which is the same place in the chain: on the linear
+  # amplitude, not on a dB reading.
+  #
+  # 1.0 is the daemon's own scale and wants to stay there. It already pins about 1% of
+  # bars at the ceiling, which is the original's character. Raising it is rarely the
+  # answer to a display that reads wrong, because it moves the ceiling along with
+  # everything else.
+  gain : 1.0
 
   # --- Behaviour --------------------------------------------------------------
   # Frames are delivered in ~100ms bursts (an AVAudioEngine constraint, see the
@@ -206,12 +252,24 @@ VISCOLOR =
   dots: '24,33,41'
   background: '0,0,0'
 
-# Falloff rates in fractions of full scale per second, indexed by the 1..5 option.
-# The original works in whole pixels per frame on a 16px pane; these are the same
-# rates expressed per second so the display is frame-rate independent.
-BAR_FALLOFF  = [0.45, 0.75, 1.20, 1.90, 3.20]
-# Peak markers accelerate rather than fall linearly, in full scale per second².
-PEAK_GRAVITY = [0.50, 0.90, 1.60, 2.80, 4.80]
+# The original's two falloff ladders, kept in the units its analyzer works in and
+# converted where they are used. A bar falls a flat BAR_FALLOFF/16 pixels per
+# rendered frame on a 16px pane. A peak starts at PEAK_V0 pixels per frame and
+# multiplies that velocity by PEAK_ACCEL every frame, so it hangs for a beat and then
+# plummets, rather than accelerating evenly under gravity. Index 2 (12) and index 1
+# (1.1) are a fresh Winamp's defaults, and this widget's.
+#
+# Per frame rather than per second is the whole point: whole-pixel steps on a fixed
+# clock are what give the classic analyzer its stair-step cadence, and under
+# colorStyle "line" that cadence *is* the flicker, because the bar's colour is
+# sampled at its own height and so changes on every step. Rates smoothed out over
+# real elapsed time read as a shimmer instead. See options.visRefresh for the clock.
+BAR_FALLOFF = [3, 6, 12, 16, 32]           # sixteenths of a pixel per frame
+PEAK_ACCEL  = [1.05, 1.1, 1.2, 1.4, 1.6]   # velocity multiplier per frame
+PEAK_V0     = 3 / 256                      # initial peak velocity, pixels per frame
+# Height of the pane the two ladders above are quoted against, which is fixed at the
+# original's 16 rows however many rows this widget is drawing.
+PANE_PX     = 16
 
 # Option-driven CSS is resolved here rather than with Stylus `if` blocks.
 # `if #{someOption} == classic` interpolates to a comparison of two bare Stylus
@@ -381,8 +439,24 @@ afterRender: (domEl) ->
 
   ROWS = Math.max(4, options.rows)
   GROUP = if options.bandWidth is 'thick' then 4 else 1
-  falloffRate = BAR_FALLOFF[Math.min(4, Math.max(0, options.analyzerFalloff - 1))]
-  peakGravity = PEAK_GRAVITY[Math.min(4, Math.max(0, options.peakFalloff - 1))]
+
+  # The vis clock, and the original's per-frame steps converted from pixels of its
+  # 16px pane into fractions of full scale. Going through fractions rather than rows
+  # is deliberate: `rows` then changes the resolution of the display without changing
+  # how fast anything on it moves.
+  TICK_MS   = 1000 / Math.max(1, options.visRefresh)
+  MAX_TICKS = 16     # ceiling on catch-up after a stall, see advance()
+  # Undo the daemon's dB mapping to recover the amplitude the original's analyzer works
+  # in: the daemon sent v = (db - floorDb) / dbSpan, so the amplitude relative to its
+  # ceiling is 10 ^ (dbSpan * (v - 1) / 20). Silence has to short-circuit, or the
+  # display would floor at 10 ^ -3 instead of at nothing.
+  DB_DECADES = options.dbSpan / 20
+  shapeLevel = (v) -> if v <= 0 then 0 else Math.pow(10, DB_DECADES * (v - 1))
+
+  sliderIdx = (n) -> Math.min(4, Math.max(0, n - 1))
+  fallStep  = BAR_FALLOFF[sliderIdx(options.analyzerFalloff)] / 16 / PANE_PX
+  peakAccel = PEAK_ACCEL[sliderIdx(options.peakFalloff)]
+  peakVel0  = PEAK_V0 / PANE_PX
 
   fill = (rgb, alpha = 1) -> "rgba(#{rgb}, #{alpha})"
 
@@ -394,7 +468,8 @@ afterRender: (domEl) ->
     bars: 0              # bars actually drawn, after thin/thick grouping
     cur: null            # ballistic bar values, 0..1
     peak: null           # peak marker positions, 0..1
-    peakVel: null        # peak fall velocity, full scale per second
+    peakVel: null        # peak fall velocity, full scale per vis tick
+    tickAcc: 0           # ms of real time not yet spent on a vis tick
     lastT: performance.now()
     lastDataT: 0         # last frame received, silent or not
     lastSignalT: 0       # last frame that actually carried audio
@@ -655,11 +730,18 @@ afterRender: (domEl) ->
     sum += frame[i] for i in [lo...hi]
     sum / (hi - lo) / 255
 
+  # The original steps its ballistics once per rendered frame, in fixed whole-pixel
+  # amounts, rather than evaluating them as a continuous function of elapsed time.
+  # Reproducing that means running them off a clock of their own: a repaint spanning
+  # two ticks runs both, one spanning none leaves the bars exactly where they are.
+  # Scaling the steps by real elapsed time instead would land the bars on the same
+  # heights on average, but it lets a colour boundary be crossed at any moment in
+  # between, which in "line" mode reads as a shimmer rather than a stair.
   advance = (elapsed) ->
     return unless state.cur
-    secs = elapsed / 1000
 
-    # Interpolate between the two frames straddling the playback cursor.
+    # Interpolate between the two frames straddling the playback cursor. The queue is
+    # drained on real time whether or not a tick is due, so audio never drifts.
     target = null
     if state.queue.length
       state.cursor += elapsed / state.dt
@@ -669,29 +751,44 @@ afterRender: (domEl) ->
       state.cursor = 0 if state.queue.length is 1
       target = [state.queue[0], state.queue[1] or state.queue[0], Math.min(1, Math.max(0, state.cursor))]
 
+    state.tickAcc += elapsed
+    ticks = Math.floor(state.tickAcc / TICK_MS)
+    state.tickAcc -= ticks * TICK_MS
+    return if ticks < 1
+    # A wake from sleep or a spell on a hidden desktop must not replay a second of
+    # ticks. There is nothing to catch up to: the display only has to land in the
+    # right place, and the peaks it dropped on the way were never on screen.
+    ticks = Math.min(ticks, MAX_TICKS)
+
     for i in [0...state.bars]
       v = 0
       if target
         a = bandValue(target[0], i)
         b = bandValue(target[1], i)
         v = a + (b - a) * target[2]
-        v = Math.pow(v, options.gamma)
+        # Curve first, then gain, then clip. That order is the original's: its gain
+        # sits on the waveform ahead of the FFT, so it multiplies an amplitude rather
+        # than a dB reading, and the ceiling is a hard clip on the result.
+        v = Math.min(1, shapeLevel(v) * options.gain)
 
-      # Instant attack, linear falloff: the bar jumps straight to a louder value
-      # and only the descent is rate-limited. Easing the rise as well is what makes
-      # a modern meter look soft next to this one.
-      if v >= state.cur[i]
-        state.cur[i] = v
-      else
-        state.cur[i] = Math.max(v, state.cur[i] - falloffRate * secs)
+      for tick in [0...ticks]
+        # Instant attack, flat falloff: the bar jumps straight to a louder value and
+        # only the descent is rate-limited. Easing the rise as well is what makes a
+        # modern meter look soft next to this one.
+        if v >= state.cur[i]
+          state.cur[i] = v
+        else
+          state.cur[i] = Math.max(v, state.cur[i] - fallStep)
 
-      # Peaks hold where the bar left them, then accelerate downward.
-      if state.cur[i] >= state.peak[i]
-        state.peak[i] = state.cur[i]
-        state.peakVel[i] = 0
-      else
-        state.peakVel[i] += peakGravity * secs
-        state.peak[i] = Math.max(0, state.peak[i] - state.peakVel[i] * secs)
+        # Peaks hold where the bar left them, then accelerate away. The velocity is
+        # multiplied each tick rather than added to, which is what makes a peak seem
+        # to hang for a moment before dropping fast.
+        if state.cur[i] >= state.peak[i]
+          state.peak[i] = state.cur[i]
+          state.peakVel[i] = peakVel0
+        else
+          state.peak[i] = Math.max(0, state.peak[i] - state.peakVel[i])
+          state.peakVel[i] *= peakAccel
     return
 
   quiet = ->

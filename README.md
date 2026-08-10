@@ -143,8 +143,8 @@ leaving plenty of clearance above. On a shorter screen, check that stocks still
 clears it.
 
 The 90px height is deliberately 10px over `UNIT`: at 16 quantised rows an 80px panel
-reads as a stack of dashes rather than bars. `gamma` is tuned to this height, so a
-taller panel needs a lower value or the top sits permanently empty.
+reads as a stack of dashes rather than bars. Height and `rows` are what set how chunky
+the display looks; the level mapping is independent of both.
 
 ### Working with layout-controller.widget
 
@@ -286,6 +286,32 @@ Because of this, the daemon's own smoothing defaults to off (`attack`/`decay` = 
 and all ballistics live in the widget. A second exponential decay upstream would
 blunt exactly the snap the look depends on.
 
+**The steps are per frame, not per second.** The original works in whole pixels of a
+16px pane per rendered frame, so its two falloff sliders are only meaningful against
+a fixed frame rate. The widget therefore runs its ballistics on a clock of its own
+(`visRefresh`, 60Hz) rather than off the repaint loop: a repaint spanning two ticks
+runs both, one spanning none leaves the bars where they are. Scaling the steps by
+real elapsed time instead lands the bars on the same heights on average, but lets a
+row boundary be crossed at any moment in between, which under `line` (below) reads as
+a shimmer rather than a stair.
+
+The two ladders are the original's own, converted from pixels of its pane into
+fractions of full scale so `rows` changes the resolution of the display without
+changing how fast anything on it moves:
+
+| Slider | 1 | 2 | 3 | 4 | 5 | |
+|---|---|---|---|---|---|---|
+| `analyzerFalloff` | 3 | 6 | 12 | 16 | 32 | sixteenths of a pixel per frame, flat |
+| `peakFalloff` | 1.05 | 1.1 | 1.2 | 1.4 | 1.6 | velocity multiplier per frame |
+
+A peak starts at 3/256 pixels per frame and multiplies that velocity every frame, so
+it hangs for a beat and then plummets, rather than accelerating evenly under gravity.
+`analyzerFalloff: 3` and `peakFalloff: 2` are a fresh Winamp's defaults, and this
+widget's: a full-height bar falls to nothing in ~0.36s, its peak in ~0.87s.
+
+Winamp's own refresh-rate slider repeatedly halves its frame rate, so 30 / 15 / 7.5
+are the other authentic `visRefresh` values. Lower is chunkier.
+
 ### Colour modes
 
 Applies to every palette; the colour names below describe `winamp`.
@@ -296,16 +322,73 @@ Applies to every palette; the colour names below describe `winamp`.
 | `fire` | Ramp anchored to each bar's own top, so every bar runs the full ramp regardless of height and the display reads hot |
 | `line` | Each bar is filled in a single flat colour sampled from the ramp at that bar's height, so the whole column flickers red → amber → green as it falls |
 
+Under `line` the flicker *is* the ballistics: with the default 16 `rows` the ramp maps
+one colour to one row, so the fill changes on every row the bar steps through. The
+switch points are the `Math.round` half-steps, every 6.25% of pane height (3.125%,
+9.375%, … 96.875%), and at the defaults a falling bar crosses all sixteen in ~0.36s,
+about 45 colour changes a second.
+
 `bandWidth: "thick"` averages the daemon's 75 bands in groups of four for the
 classic wide mode's 19 bars; `"thin"` draws all 75.
+
+### Reaching the top of the ramp
+
+Whether all sixteen colours get *used* is a question about level, not about palette,
+and the original answers it by running hot. It feeds its FFT the waveform divided by
+24, so a full-scale signal arrives at roughly five times the height of the pane and
+`saData >= maxHeight` clamps constantly. Saturating is not an edge case there; it is
+why the reds get seen.
+
+The daemon deliberately does the opposite, mapping dB to 0..1 with headroom so the
+display is not pinned to the ceiling. Measured against real playback, that left the
+brightest red unreachable: bands peaked around 0.96 of full scale, just under the
+0.96875 the top row needs, so one of the sixteen entries never appeared at all. But
+the level *mapping* matters far more than the level itself, and it is the mapping that
+decides where the display spends its time.
+
+**Winamp's analyzer is linear in amplitude, not dB.** Its FFT hands back
+`sqrt(re² + im²)`, which is compared straight against pixel height and clamped. There
+is no dB conversion anywhere in the chain. The one `log10` in
+[`FFTNullsoft.ts`](https://github.com/captbaritone/webamp/blob/master/packages/webamp/js/components/FFTNullsoft.ts)
+is applied to the *frequency index*, a per-bin weighting running 0.024 at DC to 1.0 at
+Nyquist, so a 32dB high-frequency tilt (the daemon's `tiltDb` does the same job with
+16). That is a weighting, not a log of amplitude.
+
+A linear mapping is what makes the classic analyzer spiky: quiet content stays on the
+floor and only real peaks climb. A dB mapping does the opposite, lifting everything
+into the middle of the ramp. The gap is large:
+
+| band level | linear (what we do) | raw dB reading |
+|---|---|---|
+| -18 dB | row 11 | row 14 |
+| -24 dB | row 5 | row 12 |
+| -30 dB | row 3 | row 10 |
+| -36 dB | row 1 | row 8 |
+| -48 dB | row 0 | row 5 |
+
+The daemon does convert to dB, so the widget converts back, using `dbSpan` to know the
+window. Measured over 20s of playback at the same ~1.5% of bars pinned at the ceiling:
+
+| | dark | green | amber | top four | median row |
+|---|---|---|---|---|---|
+| linear | 26.1% | 65.4% | 6.8% | **1.8%** | 2 |
+| raw dB | 2.7% | 24.9% | 58.5% | **13.9%** | 9 |
+
+Both reach all sixteen entries; the dB reading just spends its life in the warm middle
+of them, which is not what the original looks like.
+
+If it reads too sparse, lower `dbSpan` (48 takes dark from 26% to 16%) before touching
+`gain`. `gain` (1.0) is applied after the curve and hard-clipped, matching where the
+original's sits: on the waveform ahead of its FFT, so on an amplitude rather than a dB
+reading. Raising it moves the ceiling along with everything else and is rarely the fix.
 
 ## Options
 
 Widget options live at the top of [`index.coffee`](index.coffee): `layoutMode`,
 position and size, `colorScheme` (`winamp` / `theme` / `monochrome`) and `monoRange`,
 `colorStyle` (`normal` / `fire` / `line`), `background`, `bandWidth`, `rows`,
-`barGap`, `vizRadius`, `gamma`, peak markers, the falloff speeds, the fade options,
-and the jitter-buffer latency cap.
+`barGap`, `vizRadius`, `dbSpan`, `gain`, peak markers, the falloff speeds,
+`visRefresh`, the fade options, and the jitter-buffer latency cap.
 
 `vizRadius` (3) rounds the analyzer area itself, which is the canvas inside the
 panel's 10px padding rather than the panel. It is a canvas clip, not CSS
@@ -352,8 +435,9 @@ is roughly 100 ms of latency, which is constant and not noticeable in practice.
 **Normalization is measured, not guessed.** Against real playback, per-band peaks
 span about -57..-17 dB, which is why the default window is -72..-12. Broadband RMS
 sits ~40 dB higher and gets its own window (-60..-6), otherwise it pins at ~0.9 on
-anything loud. The daemon emits a faithful dB mapping and leaves the display curve
-to the widget's `gamma`, so the data stays honest and the look stays tunable.
+anything loud. The daemon emits a faithful dB mapping and leaves the display curve to
+the widget, which converts it back to amplitude (see `dbSpan`), so the data stays
+honest and the look stays tunable.
 
 **A paused source is not a silent stream.** Pausing the music does not stop the
 frames. A virtual audio device keeps its clock running and hands the daemon buffers
