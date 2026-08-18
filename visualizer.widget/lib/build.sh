@@ -14,6 +14,15 @@
 #      again on every rebuild. It still re-prompts when the code actually
 #      changes (the cdhash moves), but not for unrelated reruns.
 #
+#      So APPROVE THAT PROMPT, and check afterwards if the daemon comes back
+#      silent. A denied process is handed zero-filled buffers rather than an
+#      error: capture starts, buffers arrive at a steady rate, nothing throws,
+#      and every band reads 0. That is indistinguishable from a silent device and
+#      survives restarting the daemon, the player and Loopback. A recorded deny
+#      sticks, and tccutil cannot reset a bare binary by identifier, so it has to
+#      be switched back on in System Settings > Privacy & Security > Microphone.
+#      See the note under "Build the daemon" in README.md.
+#
 # The plist is NOT named Info.plist on purpose. codesign treats a directory
 # containing an Info.plist as a bundle, and would then produce a bundle signature
 # with a sealed resource directory over all of lib/ — which goes invalid the

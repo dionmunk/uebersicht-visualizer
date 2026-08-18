@@ -92,6 +92,29 @@ The plist is deliberately not named `Info.plist`: codesign treats any directory
 containing one as a bundle, and would sign all of `lib/` with a sealed resource
 directory that goes invalid whenever anything else in there changes.
 
+> **After a rebuild, check the microphone grant.** Rebuilding moves the binary's cdhash,
+> so macOS treats it as a new program and asks again. That is expected. What is not
+> obvious is the failure mode if the request is missed or dismissed: **a denied process
+> is handed zero-filled buffers, not an error.** Capture starts, buffers arrive at a
+> perfectly steady rate, nothing throws, nothing logs, and every band reads 0. It is
+> indistinguishable from a silent device, and it survives restarting the daemon, the
+> player and Loopback, because none of those are the problem.
+>
+> A recorded *deny* also sticks. `tccutil reset Microphone <id>` does not work here,
+> since that takes a bundle identifier and this is a bare binary, and the untargeted
+> `tccutil reset Microphone` would clear every app on the machine. Fix it by hand in
+> **System Settings > Privacy & Security > Microphone**, switching `visualizerd` back on.
+>
+> To check the state directly:
+>
+> ```sh
+> sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+>   "select client, auth_value from access
+>    where service='kTCCServiceMicrophone' and client like '%visualizerd%';"
+> ```
+>
+> `2` is allowed, `0` is denied. Requires Full Disk Access for the calling terminal.
+
 ### 3. Check it can see the device
 
 ```sh
@@ -145,6 +168,41 @@ clears it.
 The 90px height is deliberately 10px over `UNIT`: at 16 quantised rows an 80px panel
 reads as a stack of dashes rather than bars. Height and `rows` are what set how chunky
 the display looks; the level mapping is independent of both.
+
+### Two columns wide
+
+`columns` sets how many grid columns the widget spans, and with it how many bars are
+drawn:
+
+| `columns` | width | bars (`thick`) | bar width |
+|---|---|---|---|
+| `1` (default) | 320 (`COL`) | 19 | 14.8px |
+| `2` | 650 (`2·COL + GAP`) | 38 | 15.6px |
+
+The bar count doubles with the width on purpose. The extra room buys **more** bars
+rather than wider ones, so a two-column display keeps the bar width the original has
+instead of stretching into something that no longer reads as that analyzer. It comes
+from grouping the daemon's 75 bands half as coarsely: `thick` averages them in twos
+rather than fours.
+
+**`thin` is the exception and cannot double.** It is already one bar per band, so there
+is nothing left to divide and a two-column widget draws the same 75 bars at twice the
+width. Extra detail there has to come from the daemon, which takes a `--bands` flag,
+though it caps at 128, so a true doubling to 150 is not available even by hand.
+
+Width follows the grid symbolically, as `calc(var(--grid-col) * 2 + var(--grid-gap))`,
+so the span tracks a grid the controller computes differently. `columns` only decides
+the footprint while `width` is `"grid"`; an explicit px `width` wins over it, and
+`columns` is then left setting nothing but the bar density.
+
+Two notes on where a wide one lands:
+
+- **Managed mode needs nothing extra.** The layout controller derives a widget's span
+  from its measured width, so 650px is packed as two columns with no `data-layout-span`
+  declared here.
+- **Manual mode is your problem.** At the default `horizontalOffset: 340` a two-column
+  widget covers columns 2 and 3, which is where `github-contributions` sits in the
+  documented grid. Move it, or let the controller manage it.
 
 ### Working with layout-controller.widget
 
@@ -224,8 +282,8 @@ block to reskin it.
 
 Only the spectrum and the peak marker are taken from a skin. The backdrop dots and the
 pane behind them are transcribed for completeness but not drawn: the dots always use
-the theme's neutral (below) and the pane is this collection's translucent panel unless
-`background` is set to `classic`.
+the theme's neutral (below) and the pane is this collection's own panel, or nothing at
+all.
 
 **`theme`** and **`monochrome`** both follow `theme-controller.widget`. See
 [Theming](#theming) below.
@@ -273,8 +331,6 @@ colour the theme file wrote, so they are normalised through a scratch canvas
 Both degrade gracefully with no controller installed: `theme` falls back to the
 Winamp ramp rather than inventing colours, and `monochrome` falls back to white ink.
 
-One combination to avoid: `monochrome` with `background: "classic"` puts black ink on
-an opaque black pane in dark mode, and the bars vanish. Use `panel` or `none`.
 
 ### Background
 
@@ -283,7 +339,6 @@ an opaque black pane in dark mode, and the bars vanish. Use `panel` or `none`.
 | Value | Behaviour |
 |---|---|
 | `panel` | This collection's translucent blurred panel |
-| `classic` | The opaque black pane, as in Winamp |
 | `none` | Nothing. The bars sit straight on the desktop, with no pane and no blur |
 
 `none` keeps the widget's footprint and padding, so the bars do not shift position
@@ -430,6 +485,8 @@ Daemon options:
 --port <n>              WebSocket port (default: 41500)
 --fft <n>               FFT window, power of two (default: 2048)
 --bands <n>             frequency bands (default: 75, the classic band count)
+--simulate-stall <sec>  pull the tap that long after capture starts, to
+                        exercise the watchdog
 --floor / --ceil <dB>   normalization window (default: -72 / -12)
 --tilt <dB>             high-frequency lift (default: 16)
 --attack / --decay      smoothing coefficients (default: 1.0 / 1.0, i.e. off —

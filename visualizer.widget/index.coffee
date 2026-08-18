@@ -42,11 +42,32 @@ options =
   verticalOffset : 10                  # px
   horizontalOffset : 340               # px
 
+  # How many grid columns wide the widget is.
+  #
+  #   1  one column (320px), matching every other single-column widget.
+  #   2  two columns (650px), the footprint github-contributions takes in its `year`
+  #      span: n·COL + (n-1)·GAP, per LAYOUT.md's horizontal formula.
+  #
+  # Two columns also **doubles the number of bars**, so the extra room buys more of
+  # them rather than wider ones: the bands are grouped half as coarsely, turning thick
+  # mode's 19 bars into 38 at very nearly the same bar width (15.6px against 14.8px).
+  # That is the whole point of tying the two together, since a display that just
+  # stretches its bars stops looking like the original. See bandWidth below for the
+  # one case that cannot double.
+  #
+  # This only decides the footprint while `width` is "grid". An explicit px width wins
+  # over it, and this option then sets nothing but the bar density.
+  #
+  # Nothing else needs saying when layout-controller.widget is installed: it derives a
+  # widget's column span from its measured width (its `spanOf`), so a two-column
+  # widget is packed as two columns with no `data-layout-span` declared here.
+  columns : 1                          # 1 | 2
+
   # Footprint. A number is px; the string "grid" reads the matching token published
   # by layout-controller.widget instead, so the widget follows the grid rather than
   # restating it:
   #
-  #   width  "grid" -> var(--grid-col, 320px)    one column
+  #   width  "grid" -> one column, or the `columns` span above
   #   height "grid" -> var(--grid-unit, 80px)    one row, the base widget height
   #
   # The tokens carry the same values this widget would hardcode, so "grid" changes
@@ -100,6 +121,12 @@ options =
 
   # Bar width. "thick" averages the incoming bands in groups of four, which turns
   # the daemon's 75 bands into the classic wide mode's 19 bars.
+  #
+  # At `columns: 2` the grouping halves and the bar count doubles: thick goes to 38
+  # bars. "thin" is the exception, and cannot double. It is already one bar per band,
+  # so there is nothing left to divide and a two-column widget simply draws its 75
+  # bars wider. Detail there has to come from the daemon instead, which takes a
+  # `--bands` flag (capped at 128, so 150 is not available even by hand).
   bandWidth : "thick"                  # thin | thick
 
   # Show the falling peak markers above each bar.
@@ -129,7 +156,6 @@ options =
   # What sits behind the bars.
   #
   #   "panel"   this collection's translucent blurred panel.
-  #   "classic" the opaque black pane, as in Winamp.
   #   "none"    nothing. The bars sit straight on the desktop with no pane behind
   #             them and no blur. The widget keeps its footprint and padding, so
   #             the bars do not move when you switch, and the fade still works
@@ -137,10 +163,10 @@ options =
   #
   # With "none" the "no audio daemon" message loses its backing, but keeps the
   # text-shadow, so it stays readable on most wallpapers.
-  background : "panel"               # panel | classic | none
+  background : "panel"               # panel | none
 
   # Draw the dotted backdrop behind the bars.
-  grid : false                          # true | false
+  grid : true                          # true | false
 
   # Round the corners of the analyzer area itself, in px. This is the canvas inside
   # the panel's 10px padding, not the panel, which has its own 10px radius.
@@ -235,10 +261,11 @@ options =
 # spectrum colours, 5 oscilloscope colours, peak); drop another skin's values in
 # here to reskin the analyzer.
 #
-# `dots` and `background` are transcribed for completeness but are not drawn: the
+# `dots` and `background` are transcribed for completeness but are never drawn: the
 # backdrop dots always take the theme's neutral instead (see buildPalette), and the
-# pane behind them is this collection's translucent panel unless `background` is set
-# to "classic". Only `spectrum` and `peak` come from a skin.
+# pane behind them is this collection's own panel, or nothing at all. Only `spectrum`
+# and `peak` come from a skin. Both are kept so the block stays a faithful copy of the
+# file's format, which is what makes another skin's values droppable straight in.
 VISCOLOR =
   spectrum: [
     '239,49,16'   # 0 — top
@@ -282,11 +309,12 @@ PEAK_V0     = 3 / 256                      # initial peak velocity, pixels per f
 PANE_PX     = 16
 
 # Option-driven CSS is resolved here rather than with Stylus `if` blocks.
-# `if #{someOption} == classic` interpolates to a comparison of two bare Stylus
+# `if #{someOption} == someValue` interpolates to a comparison of two bare Stylus
 # identifiers, which does not evaluate the way it reads: it silently takes the
-# else branch every time. That went unnoticed for the position options (whose
-# defaults want the else branch anyway) but meant background:"classic" never
-# applied. Building the finished declarations in CoffeeScript removes the guesswork.
+# else branch every time. That went unnoticed for the position options, whose
+# defaults want the else branch anyway, and left the non-default `background`
+# settings dead. Building the finished declarations in CoffeeScript removes the
+# guesswork.
 #
 # Second trap, for any value spanning more than one line: it has to carry the exact
 # indentation of the site it is interpolated into, because Stylus reads indentation
@@ -308,12 +336,29 @@ INDENT_RULE = "\n  "   # interpolated among a rule's properties (.panel)
 # renders identically with no controller installed.
 GRID_COL  = 'var(--grid-col, 320px)'
 GRID_UNIT = 'var(--grid-unit, 80px)'
+GRID_GAP  = 'var(--grid-gap, 10px)'
 
-widthCss  = if options.width  is 'grid' then GRID_COL  else "#{options.width}px"
+# Column span, clamped: anything that is not 2 is one column. Read in two places, the
+# footprint below and the band grouping in afterRender, which is exactly the coupling
+# the `columns` option describes.
+COLUMNS = if options.columns is 2 then 2 else 1
+
+# A span of n columns is n·COL + (n-1)·GAP (LAYOUT.md). Left symbolic rather than
+# resolved to 650px so it still follows a grid the controller computes differently,
+# the same reason the single-column case reads a token instead of hardcoding 320.
+gridWidthCss =
+  if COLUMNS > 1
+    "calc(#{GRID_COL} * #{COLUMNS} + #{GRID_GAP} * #{COLUMNS - 1})"
+  else
+    GRID_COL
+
+widthCss  = if options.width  is 'grid' then gridWidthCss else "#{options.width}px"
 heightCss = if options.height is 'grid' then GRID_UNIT else "#{options.height}px"
-# Centring needs half the width, which has to stay symbolic when it is a token.
+# Centring needs half the width, which has to stay symbolic when it is a token. The
+# nested calc() in the two-column case is deliberate and valid: dividing a calc() by a
+# plain number is allowed, and flattening it by hand would mean resolving the tokens.
 halfWidthCss =
-  if options.width is 'grid' then "calc(#{GRID_COL} / -2)" else "-#{options.width / 2}px"
+  if options.width is 'grid' then "calc(#{gridWidthCss} / -2)" else "-#{options.width / 2}px"
 
 vertCss =
   if options.verticalPosition is 'center'
@@ -329,8 +374,6 @@ horizCss =
 
 panelBgCss =
   switch options.background
-    when 'classic'
-      "background rgba(#{VISCOLOR.background}, .82)"
     when 'none'
       # No pane: the bars sit directly on the desktop. Written out as an explicit
       # `transparent` rather than an empty string, both so the rule never ends up
@@ -349,7 +392,7 @@ command: ""
 refreshFrequency: false
 
 style: """
-  // grid: foot of column 2, beside music.widget (see LAYOUT.md)
+  // grid: foot of column 2, beside music.widget, #{COLUMNS}×1 (see LAYOUT.md)
   font-family -apple-system, BlinkMacSystemFont, system-ui, sans-serif
   color var(--text, #fff)
   position absolute
@@ -455,7 +498,17 @@ afterRender: (domEl) ->
   return unless ctx
 
   ROWS = Math.max(4, options.rows)
-  GROUP = if options.bandWidth is 'thick' then 4 else 1
+
+  # Bands averaged into one bar. Halving this per column of span is what turns the
+  # extra width into extra bars instead of fatter ones: thick mode's group of 4 becomes
+  # 2, so 75 bands draw 38 bars rather than 19, each within a pixel of its old width.
+  #
+  # The floor of 1 is where thin mode lands, and it is a real limit rather than a
+  # rounding detail: one bar per band is already the finest the wire format carries, so
+  # a two-column thin display draws the same 75 bars twice as wide. Only the daemon's
+  # `--bands` can add detail there.
+  BASE_GROUP = if options.bandWidth is 'thick' then 4 else 1
+  GROUP = Math.max(1, Math.round(BASE_GROUP / COLUMNS))
 
   # The vis clock, and the original's per-frame steps converted from pixels of its
   # 16px pane into fractions of full scale. Going through fractions rather than rows

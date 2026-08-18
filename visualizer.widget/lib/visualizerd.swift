@@ -25,6 +25,7 @@ import AVFoundation
 import Accelerate
 import Network
 import CoreAudio
+import AudioToolbox
 
 // MARK: - Configuration
 
@@ -56,13 +57,13 @@ struct Config {
     // 16 dB was picked against real playback at 75 bands: at 9 dB everything above
     // the bass sat in the bottom row and only the left third of the display moved.
     var tiltDb: Float = 16
-    // NOTE: there is deliberately no buffer-size knob here. AVAudioEngine's input
-    // tap coalesces to ~100 ms on macOS regardless of what the device is set to
-    // (verified against both Loopback and real hardware), so setting
-    // kAudioDevicePropertyBufferFrameSize bought nothing measurable while
-    // mutating a device other apps are playing through, which interrupted
-    // playback. The frame rate is recovered in the analyzer instead, by emitting
-    // every hop inside each buffer rather than one frame per callback.
+    // NOTE: there is deliberately no buffer-size knob here. Setting
+    // kAudioDevicePropertyBufferFrameSize would mutate a device other apps are
+    // playing through, which interrupted playback, and it buys nothing: the frame
+    // rate is set by the analyzer's hop, not by the callback size. AUHAL hands us
+    // whatever the device's slice is (commonly 512-1024 frames) and the analyzer
+    // emits every hop inside each buffer rather than one frame per callback, so
+    // the output rate is identical either way.
     // Smoothing defaults to off (1.0 = pass the measured value straight through).
     // Bar ballistics belong to the renderer, not here: the widget models the classic
     // analyzer's instant attack + linear falloff, and a second exponential decay at
@@ -73,6 +74,9 @@ struct Config {
     var listOnly = false
     var selfTest = false
     var verbose = false
+    /// Seconds after capture starts to yank the tap, leaving the engine up. Exercises
+    /// the watchdog against the real failure rather than a simulated one. 0 disables.
+    var simulateStallAfter: Double = 0
 }
 
 /// Log-spaced band edges in Hz. Shared by the analyzer and by --selftest so the
@@ -108,6 +112,8 @@ func parseArgs() -> Config {
             c.selfTest = true
         case "--verbose", "-v":
             c.verbose = true
+        case "--simulate-stall":
+            if let v = it.next(), let n = Double(v) { c.simulateStallAfter = n }
         case "--device", "-d":
             if let v = it.next() { c.deviceName = v }
         case "--port", "-p":
@@ -132,6 +138,8 @@ func parseArgs() -> Config {
             visualizerd — audio spectrum daemon
 
               --list, -l              list input-capable audio devices and exit
+              --simulate-stall <sec>  pull the tap that long after capture starts,
+                                      to exercise the watchdog
               --selftest              push a synthetic tone through the analyzer
                                       and print the result (no device, no TCC)
               --device, -d <name>     input device to tap (default: Music)
@@ -306,11 +314,14 @@ final class Analyzer {
 
     /// Feed mono samples. Returns every frame produced by this buffer.
     ///
-    /// AVAudioEngine's input tap hands us ~100 ms at a time on macOS no matter what
-    /// buffer size we request, so a single frame per callback would mean analyzing
-    /// one 42 ms window out of every 100 ms and dropping the rest — transients in
-    /// the gap would simply never appear. Instead we step the whole buffer at hop
-    /// resolution and return the lot; the client plays them back on a jitter buffer.
+    /// Callback sizes are not ours to choose: the HAL delivers whatever slice the
+    /// device uses, and the old AVAudioEngine tap coalesced to ~100 ms. Emitting a
+    /// single frame per callback would therefore tie the output rate to the buffer
+    /// size and, on a large buffer, analyze one 42 ms window out of every 100 ms and
+    /// drop the rest — transients in the gap would simply never appear. Instead we
+    /// step the whole buffer at hop resolution and return the lot, which makes the
+    /// frame rate independent of the callback size; the client plays them back on a
+    /// jitter buffer.
     func feed(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Float) -> [SpectrumFrame] {
         if sampleRate != lastSampleRate, sampleRate > 0 {
             lastSampleRate = sampleRate
@@ -509,10 +520,44 @@ final class WSServer {
 
 // MARK: - Capture
 
+/// True if CoreAudio reports the device as running for *anyone*. This is the ground truth
+/// the old device check was missing: the audio unit's own property read-back will happily
+/// report the device that was asked for even when the render graph ended up elsewhere.
+func deviceIsRunningSomewhere(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr else { return false }
+    return value != 0
+}
+
+/// Device-pinned input capture, built on AUHAL.
+///
+/// This was an `AVAudioEngine` + `installTap`, which looked right and even read the device
+/// property back after setting it — but the read-back ran *before* `engine.prepare()`, and
+/// starting the engine rebuilt the IO graph around a **default-device aggregate** (visible
+/// as `CADefaultDeviceAggregate-<pid>` in `pmset -g assertions`). The configured device was
+/// dropped on the floor and the unit rendered from the default input instead, i.e. whatever
+/// microphone happens to be selected. Every symptom pointed the wrong way: audio flowed,
+/// buffers arrived at the normal rate, nothing threw, and the log still named the loopback
+/// device. The visualizer was reacting to the room rather than to the music.
+///
+/// AUHAL with the output element disabled has no reason to build that aggregate, so the
+/// device set here is the device that renders. Verification now happens *after* the unit is
+/// running, and asks CoreAudio which device is actually live rather than trusting the unit.
 final class Capture {
-    private var engine: AVAudioEngine?
+    private var unit: AudioUnit?
+    private var abl: UnsafeMutableAudioBufferListPointer?
+    private var ablFrameCapacity = 0
     private var monoBuf: UnsafeMutablePointer<Float>
     private var monoCap: Int
+    private var sampleRate: Double = 48000
+    private var onSamples: ((UnsafePointer<Float>, Int, Float) -> Void)?
+    /// Set by --simulate-stall: the render callback keeps firing but stops counting, which
+    /// is precisely the failure the watchdog exists to catch.
+    private var stalled = false
     private(set) var isRunning = false
 
     init() {
@@ -521,83 +566,222 @@ final class Capture {
         monoBuf.initialize(repeating: 0, count: monoCap)
     }
 
-    deinit { monoBuf.deallocate() }
+    deinit {
+        monoBuf.deallocate()
+        releaseUnit()
+    }
 
     /// Frames delivered by the tap so far, and the size of the last buffer.
     private(set) var tapCallbacks = 0
+    /// Bumped on every successful start, so the watchdog can tell one capture session
+    /// from the next without any reset plumbing between the two.
+    private(set) var sessions = 0
     private(set) var lastFrameLength = 0
     var verbose = false
 
     func start(device: Device,
                onSamples: @escaping (UnsafePointer<Float>, Int, Float) -> Void) throws {
         guard !isRunning else { return }
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
 
-        guard let unit = input.audioUnit else {
-            throw NSError(domain: "visualizerd", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "input node has no audio unit"])
+        var desc = AudioComponentDescription(componentType: kAudioUnitType_Output,
+                                             componentSubType: kAudioUnitSubType_HALOutput,
+                                             componentManufacturer: kAudioUnitManufacturer_Apple,
+                                             componentFlags: 0,
+                                             componentFlagsMask: 0)
+        guard let component = AudioComponentFindNext(nil, &desc) else {
+            throw err(2, "no HAL output audio component")
         }
+        var newUnit: AudioUnit?
+        try check(AudioComponentInstanceNew(component, &newUnit), "instantiate HAL unit")
+        guard let unit = newUnit else { throw err(2, "HAL unit came back nil") }
+        self.unit = unit
+
+        // Input on element 1, output off on element 0. Disabling output is what keeps
+        // CoreAudio from pairing this with the default output device in an aggregate.
+        var on: UInt32 = 1
+        var off: UInt32 = 0
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input, 1, &on, UInt32(MemoryLayout<UInt32>.size)),
+                  "enable input element")
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Output, 0, &off, UInt32(MemoryLayout<UInt32>.size)),
+                  "disable output element")
+
         var deviceID = device.id
-        let status = AudioUnitSetProperty(unit,
-                                          kAudioOutputUnitProperty_CurrentDevice,
-                                          kAudioUnitScope_Global, 0,
-                                          &deviceID,
-                                          UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else {
-            throw NSError(domain: "visualizerd", code: Int(status),
-                          userInfo: [NSLocalizedDescriptionKey:
-                            "could not select device '\(device.name)' (OSStatus \(status))"])
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global, 0, &deviceID,
+                                       UInt32(MemoryLayout<AudioDeviceID>.size)),
+                  "select device '\(device.name)'")
+
+        // The hardware side of element 1 tells us the real rate and channel count.
+        var hw = AudioStreamBasicDescription()
+        var hwSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Input, 1, &hw, &hwSize),
+                  "read hardware input format")
+        guard hw.mSampleRate > 0, hw.mChannelsPerFrame > 0 else {
+            releaseUnit()
+            throw err(3, "device '\(device.name)' reported an empty input format")
+        }
+        sampleRate = hw.mSampleRate
+        let channels = min(2, Int(hw.mChannelsPerFrame))
+
+        // Ask for deinterleaved float so the downmix below is a plain vDSP add.
+        var client = AudioStreamBasicDescription(
+            mSampleRate: hw.mSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+                        | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 32, mReserved: 0)
+        try check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output, 1, &client,
+                                       UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
+                  "set client input format")
+
+        var maxFrames: UInt32 = 4096
+        var maxSize = UInt32(MemoryLayout<UInt32>.size)
+        _ = AudioUnitGetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice,
+                                 kAudioUnitScope_Global, 0, &maxFrames, &maxSize)
+        allocateBuffers(frames: max(4096, Int(maxFrames)), channels: channels)
+
+        self.onSamples = onSamples
+        self.stalled = false
+
+        var callback = AURenderCallbackStruct(
+            inputProc: { refCon, flags, timeStamp, bus, frames, _ in
+                let capture = Unmanaged<Capture>.fromOpaque(refCon).takeUnretainedValue()
+                return capture.render(flags: flags, timeStamp: timeStamp, bus: bus, frames: frames)
+            },
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback,
+                                       kAudioUnitScope_Global, 0, &callback,
+                                       UInt32(MemoryLayout<AURenderCallbackStruct>.size)),
+                  "install input callback")
+
+        try check(AudioUnitInitialize(unit), "initialize HAL unit")
+        try check(AudioOutputUnitStart(unit), "start HAL unit")
+
+        // Only now is the question meaningful. Give the HAL a beat to bring the device up,
+        // then confirm against CoreAudio instead of the unit's own property.
+        var live = false
+        for _ in 0..<30 {
+            if deviceIsRunningSomewhere(device.id) { live = true; break }
+            usleep(20_000)
+        }
+        if !live {
+            let others = inputDevices()
+                .filter { $0.id != device.id && deviceIsRunningSomewhere($0.id) }
+                .map { $0.name }
+            let blame = others.isEmpty ? "no input device is running"
+                                       : "running instead: \(others.joined(separator: ", "))"
+            releaseUnit()
+            throw err(4, "asked for '\(device.name)' but it never started — \(blame)")
         }
 
-        // Nothing here reconfigures the device. It is shared with whatever is
-        // playing through it, and this process is only a listener.
-        let format = input.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw NSError(domain: "visualizerd", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey:
-                            "device '\(device.name)' reported an empty input format"])
-        }
-
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            guard let self, let channels = buffer.floatChannelData else { return }
-            let frames = Int(buffer.frameLength)
-            guard frames > 0 else { return }
-            if frames > self.monoCap { self.grow(to: frames) }
-            if self.verbose && self.tapCallbacks == 0 {
-                FileHandle.standardError.write("""
-                visualizerd: first tap buffer — \(frames) frames, \
-                \(Int(buffer.format.sampleRate)) Hz, \(buffer.format.channelCount) ch \
-                (implies ~\(String(format: "%.1f", buffer.format.sampleRate / Double(frames))) callbacks/sec)
-
-                """.data(using: .utf8)!)
-            }
-            self.tapCallbacks += 1
-            self.lastFrameLength = frames
-
-            let channelCount = Int(buffer.format.channelCount)
-            if channelCount == 1 {
-                self.monoBuf.update(from: channels[0], count: frames)
-            } else {
-                vDSP_vadd(channels[0], 1, channels[1], 1, self.monoBuf, 1, vDSP_Length(frames))
-                var half: Float = 0.5
-                vDSP_vsmul(self.monoBuf, 1, &half, self.monoBuf, 1, vDSP_Length(frames))
-            }
-            onSamples(self.monoBuf, frames, Float(buffer.format.sampleRate))
-        }
-
-        engine.prepare()
-        try engine.start()
-        self.engine = engine
         isRunning = true
+        sessions += 1
     }
 
     func stop() {
-        guard let engine, isRunning else { return }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        self.engine = nil
+        guard isRunning else { return }
+        releaseUnit()
         isRunning = false
+    }
+
+    /// Reproduce the failure the watchdog exists for: keep the unit up and `isRunning`
+    /// true, but stop counting callbacks, so buffers quietly stop reaching the analyzer
+    /// with nothing thrown and nothing logged. Test hook, via --simulate-stall.
+    func simulateStall() {
+        guard isRunning else { return }
+        stalled = true
+    }
+
+    // MARK: Render
+
+    fileprivate func render(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                            timeStamp: UnsafePointer<AudioTimeStamp>,
+                            bus: UInt32,
+                            frames: UInt32) -> OSStatus {
+        guard let unit, let abl, Int(frames) <= ablFrameCapacity else { return noErr }
+        let count = Int(frames)
+        let bytes = UInt32(count * MemoryLayout<Float>.size)
+        for i in 0..<abl.count { abl[i].mDataByteSize = bytes }
+
+        let status = AudioUnitRender(unit, flags, timeStamp, bus, frames, abl.unsafeMutablePointer)
+        guard status == noErr else { return status }
+        guard !stalled, count > 0 else { return noErr }
+
+        if count > monoCap { grow(to: count) }
+        guard let first = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+
+        if abl.count == 1 {
+            monoBuf.update(from: first, count: count)
+        } else if let second = abl[1].mData?.assumingMemoryBound(to: Float.self) {
+            vDSP_vadd(first, 1, second, 1, monoBuf, 1, vDSP_Length(count))
+            var half: Float = 0.5
+            vDSP_vsmul(monoBuf, 1, &half, monoBuf, 1, vDSP_Length(count))
+        } else {
+            monoBuf.update(from: first, count: count)
+        }
+
+        if verbose && tapCallbacks == 0 {
+            FileHandle.standardError.write("""
+            visualizerd: first tap buffer — \(count) frames, \
+            \(Int(sampleRate)) Hz, \(abl.count) ch \
+            (implies ~\(String(format: "%.1f", sampleRate / Double(count))) callbacks/sec)
+
+            """.data(using: .utf8)!)
+        }
+        tapCallbacks += 1
+        lastFrameLength = count
+        onSamples?(monoBuf, count, Float(sampleRate))
+        return noErr
+    }
+
+    // MARK: Plumbing
+
+    private func allocateBuffers(frames: Int, channels: Int) {
+        freeBuffers()
+        let list = AudioBufferList.allocate(maximumBuffers: channels)
+        for i in 0..<channels {
+            let bytes = frames * MemoryLayout<Float>.size
+            list[i] = AudioBuffer(mNumberChannels: 1,
+                                  mDataByteSize: UInt32(bytes),
+                                  mData: malloc(bytes))
+        }
+        abl = list
+        ablFrameCapacity = frames
+    }
+
+    private func freeBuffers() {
+        guard let abl else { return }
+        for i in 0..<abl.count { free(abl[i].mData) }
+        free(abl.unsafeMutablePointer)
+        self.abl = nil
+        ablFrameCapacity = 0
+    }
+
+    private func releaseUnit() {
+        if let unit {
+            AudioOutputUnitStop(unit)
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        unit = nil
+        onSamples = nil
+        freeBuffers()
+    }
+
+    private func err(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "visualizerd", code: code,
+                userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private func check(_ status: OSStatus, _ what: String) throws {
+        guard status != noErr else { return }
+        releaseUnit()
+        throw err(Int(status), "could not \(what) (OSStatus \(status))")
     }
 
     private func grow(to frames: Int) {
@@ -678,7 +862,9 @@ if config.selfTest {
     exit(inBand ? 0 : 1)
 }
 
-guard let device = findDevice(named: config.deviceName) else {
+// Mutable because the watchdog re-resolves it: a device ID is not stable across an
+// audio-stack re-enumeration, but the name the user configured is.
+guard var device = findDevice(named: config.deviceName) else {
     let available = inputDevices().map { "  \($0.name)" }.joined(separator: "\n")
     FileHandle.standardError.write("""
     visualizerd: no input device matching '\(config.deviceName)'.
@@ -741,20 +927,52 @@ func encode(frames: [SpectrumFrame], dtMs: Float) -> Data {
     return s.data(using: .utf8) ?? Data()
 }
 
+/// Install the tap and begin feeding the analyzer. Shared by the client-count handler
+/// and the watchdog below, which is the only reason it is a function.
+///
+/// The device is looked up again by name every time. CoreAudio hands out fresh device
+/// IDs when the audio stack re-enumerates, and attaching a display does exactly that, so
+/// the ID resolved at launch can end up naming nothing. The configured name is the part
+/// that stays true.
+@discardableResult
+func startCapture(_ note: String = "") -> Bool {
+    // Refuse to fall back on the ID resolved earlier. CoreAudio reuses these numbers, so
+    // an ID whose device has gone can already name a different one, and capture would
+    // then succeed against the wrong hardware: a microphone, most likely, since those
+    // outlive a virtual device across a re-enumeration. Better to report it missing and
+    // let the watchdog try again.
+    guard let fresh = findDevice(named: config.deviceName) else {
+        FileHandle.standardError.write(
+            "visualizerd: device '\(config.deviceName)' is not present right now\n".data(using: .utf8)!)
+        return false
+    }
+    device = fresh
+    do {
+        try capture.start(device: device) { samples, frames, rate in
+            let batch = analyzer.feed(samples, count: frames, sampleRate: rate)
+            if !batch.isEmpty {
+                server.broadcast(encode(frames: batch, dtMs: analyzer.frameIntervalMs))
+            }
+        }
+        FileHandle.standardError.write(
+            "visualizerd: capture started (\(device.name), id \(device.id))\(note)\n".data(using: .utf8)!)
+        if config.simulateStallAfter > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + config.simulateStallAfter) {
+                FileHandle.standardError.write("visualizerd: simulating a stall now\n".data(using: .utf8)!)
+                capture.simulateStall()
+            }
+        }
+        return true
+    } catch {
+        FileHandle.standardError.write("visualizerd: capture failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+        return false
+    }
+}
+
 server.onClientCountChanged = { count in
     // Battery guard: no viewers, no capture. A hidden widget costs nothing.
     if count > 0 && !capture.isRunning {
-        do {
-            try capture.start(device: device) { samples, frames, rate in
-                let batch = analyzer.feed(samples, count: frames, sampleRate: rate)
-                if !batch.isEmpty {
-                    server.broadcast(encode(frames: batch, dtMs: analyzer.frameIntervalMs))
-                }
-            }
-            FileHandle.standardError.write("visualizerd: capture started (\(device.name))\n".data(using: .utf8)!)
-        } catch {
-            FileHandle.standardError.write("visualizerd: capture failed: \(error.localizedDescription)\n".data(using: .utf8)!)
-        }
+        startCapture()
     } else if count == 0 && capture.isRunning {
         capture.stop()
         FileHandle.standardError.write("visualizerd: capture stopped (no clients)\n".data(using: .utf8)!)
@@ -801,6 +1019,150 @@ if config.verbose {
     // Keep the source alive for the process lifetime.
     verboseTimer = timer
 }
+
+// MARK: - Capture watchdog
+
+// A tap can stop delivering without ever failing.
+//
+// Attaching or removing a display makes CoreAudio re-enumerate the audio stack
+// underneath a running engine. installTap has already succeeded, engine.start() has
+// already succeeded, nothing throws and nothing logs, and no buffer arrives again. The
+// capture then sits there "running" for as long as a client stays connected, because the
+// one thing that stops it is the client count reaching zero. A widget left open on the
+// desktop is a permanent client, so a dead tap stays dead until the daemon is restarted
+// by hand. That is the failure this exists to end.
+//
+// Keyed on tap callbacks, never on signal level, so a quiet passage cannot trip it.
+//
+// A stall is specifically "it was delivering, and then it stopped". The distinction
+// matters, because a virtual device with nothing playing into it does not reliably
+// deliver zero-filled buffers the way a microphone does: measured on Loopback Audio, an
+// idle device produced 2031 buffers in one 22-second run and none at all in the next. So
+// "no buffers" cannot mean "broken" on its own, or every silent stretch would restart
+// capture on a loop for as long as nothing was playing.
+//
+// Having delivered and then stopped is unambiguous, and it is exactly the observed
+// failure: capture runs fine for hours, a display is attached, and the buffers stop.
+let watchdogTick = 2.0
+let watchdogGraceFloor = 6.0
+let watchdogGraceCeiling = 60.0
+
+// Grows on each restart that does not take, so a device that is simply gone costs a log
+// line a minute rather than one every few seconds. Reset the moment buffers return.
+var watchdogGrace = watchdogGraceFloor
+var watchdogLastCallbacks = 0
+var watchdogStalledFor = 0.0
+// Per capture session: whether buffers were ever seen, and whether the one speculative
+// restart allowed to a session that never delivered has been spent.
+var watchdogSession = -1
+var watchdogSawBuffers = false
+var watchdogColdRetried = false
+var captureWatchdog: DispatchSourceTimer?
+
+let watchdog = DispatchSource.makeTimerSource(queue: .global())
+watchdog.schedule(deadline: .now() + watchdogTick, repeating: watchdogTick)
+watchdog.setEventHandler {
+    // Nothing to watch while nobody is listening. Idling without clients is the normal
+    // resting state, not a stall.
+    guard server.clientCount > 0 else {
+        watchdogLastCallbacks = capture.tapCallbacks
+        watchdogStalledFor = 0
+        watchdogGrace = watchdogGraceFloor
+        // Capture stops with the last client and starts clean with the next one, so the
+        // speculative retry is earned back here and nowhere else.
+        watchdogColdRetried = false
+        return
+    }
+
+    // The device can be swapped out from under a running tap. Loopback tears its virtual
+    // devices down and rebuilds them, and a rebuilt device keeps its name but gets a new
+    // CoreAudio ID, so the tap stays bound to an ID that no longer exists. Nothing about
+    // that looks broken from inside: buffers keep arriving on the retired ID, at a
+    // perfectly steady rate, silent forever. Counting buffers cannot catch it, because
+    // there is nothing wrong with the count. Only the ID gives it away.
+    //
+    // Worse, CoreAudio reuses retired IDs, so the tap can end up on whatever takes the
+    // number next. A microphone is the likely candidate, and then the visualizer quietly
+    // starts watching the room instead of the music.
+    if capture.isRunning,
+       let current = findDevice(named: config.deviceName),
+       current.id != device.id {
+        FileHandle.standardError.write("""
+        visualizerd: '\(config.deviceName)' moved from id \(device.id) to \(current.id), \
+        restarting capture
+
+        """.data(using: .utf8)!)
+        capture.stop()
+        startCapture(" after the device moved")
+        watchdogLastCallbacks = capture.tapCallbacks
+        watchdogStalledFor = 0
+        return
+    }
+
+    // A fresh session starts the stall reckoning over, but deliberately does NOT hand
+    // back the speculative retry: a restart is itself a new session, so resetting it here
+    // would let every retry earn another one and the "just once" would bound nothing.
+    // That is not hypothetical. It ran all night against an idle device, once a minute,
+    // and each of those restarts was a chance to reattach to the wrong device.
+    if capture.sessions != watchdogSession {
+        watchdogSession = capture.sessions
+        watchdogSawBuffers = false
+        watchdogLastCallbacks = capture.tapCallbacks
+        watchdogStalledFor = 0
+        return
+    }
+
+    if capture.isRunning {
+        let callbacks = capture.tapCallbacks
+        if callbacks != watchdogLastCallbacks {
+            watchdogLastCallbacks = callbacks
+            watchdogSawBuffers = true
+            watchdogStalledFor = 0
+            watchdogGrace = watchdogGraceFloor
+            // Buffers are flowing, so whatever this tap needed it has had. Allow one
+            // speculative retry again if it ever goes quiet from here.
+            watchdogColdRetried = false
+            return
+        }
+    }
+
+    watchdogStalledFor += watchdogTick
+    guard watchdogStalledFor >= watchdogGrace else { return }
+
+    // Running, but nothing has ever arrived on this session. That is what a broken tap
+    // looks like, and equally what an idle virtual device looks like, and the two cannot
+    // be told apart from here. So spend exactly one restart on the possibility and then
+    // sit quiet, rather than churning for as long as nothing happens to be playing.
+    if capture.isRunning && !watchdogSawBuffers {
+        guard !watchdogColdRetried else {
+            watchdogStalledFor = 0
+            return
+        }
+        watchdogColdRetried = true
+    }
+
+    // Three ways to arrive here, all wanting the same thing: a tap that delivered and
+    // stopped, the one speculative retry above, or a previous restart that could not
+    // reopen the device and left nothing running. Without that last case a failed restart
+    // would never be retried, since the only other thing that starts capture is the
+    // client count changing.
+    let reason = !capture.isRunning ? "capture not running"
+               : watchdogSawBuffers ? "no audio from the tap"
+               : "no audio since capture started"
+    FileHandle.standardError.write("""
+    visualizerd: \(reason) for \(Int(watchdogStalledFor))s with \
+    \(server.clientCount) client(s), restarting capture
+
+    """.data(using: .utf8)!)
+    watchdogStalledFor = 0
+    watchdogGrace = min(watchdogGraceCeiling, watchdogGrace * 2)
+    capture.stop()
+    startCapture(" after a stall")
+    watchdogLastCallbacks = capture.tapCallbacks
+}
+watchdog.resume()
+// Keep the source alive for the process lifetime.
+captureWatchdog = watchdog
 
 signal(SIGINT) { _ in exit(0) }
 signal(SIGTERM) { _ in exit(0) }
