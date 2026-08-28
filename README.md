@@ -496,55 +496,11 @@ Daemon options:
 
 ## Design notes
 
-**Frames arrive in ~100 ms bursts.** AVAudioEngine's input tap coalesces to 4800
-frames at 48 kHz on macOS no matter what buffer size is requested. This was verified
-against both the Loopback device and real hardware, and setting
-`kAudioDevicePropertyBufferFrameSize` does not change it (it also disrupts playback
-on a device other apps are using, so the daemon deliberately never touches it).
+Why the daemon and the widget are built the way they are: the AUHAL capture path and the
+aggregate-device bug behind it, the watchdog that catches a tap which stops delivering
+without ever failing, how frames are sized and normalized, and how the panel fades.
 
-Emitting one frame per callback would mean analyzing a single 42 ms window out of
-every 100 ms and discarding the rest, so transients falling in the gap would simply
-never appear. Instead the analyzer steps each buffer at hop resolution and returns
-every frame, giving ~86 fps of spectral data delivered in bursts of ~9. The widget
-queues those and plays them back on a clock, interpolating between frames. The cost
-is roughly 100 ms of latency, which is constant and not noticeable in practice.
-
-**Normalization is measured, not guessed.** Against real playback, per-band peaks
-span about -57..-17 dB, which is why the default window is -72..-12. Broadband RMS
-sits ~40 dB higher and gets its own window (-60..-6), otherwise it pins at ~0.9 on
-anything loud. The daemon emits a faithful dB mapping and leaves the display curve to
-the widget, which converts it back to amplitude (see `dbSpan`), so the data stays
-honest and the look stays tunable.
-
-**A paused source is not a silent stream.** Pausing the music does not stop the
-frames. A virtual audio device keeps its clock running and hands the daemon buffers
-of zeroes, which the daemon reports faithfully: measured against a paused Music.app,
-the widget still receives ~94 frames/sec with every band and every `r` (RMS) value
-at exactly 0. So "data is arriving" only means the pipeline is alive.
-
-Anything that wants to know whether audio is *playing* therefore has to look inside
-the frames, which `frameSignal` does off the daemon's `r` array. Two things depend on
-it: the fade below, and the battery guard, which keys off the last frame that carried
-signal rather than the last frame received.
-
-**Fading.** When the music pauses or stops the whole panel fades out
-(`fadeWhenSilent`), and fades back in when audio returns. The trigger is the display
-coming to rest rather than the audio stopping, because the bars are still falling for
-up to a second after a pause and fading over that reads as a glitch. So the full
-sequence is: bars fall, `fadeAfterMs` (800) of stillness, then a `fadeOutMs` (900)
-fade. Coming back is deliberately much quicker, `fadeInMs` (180), or the first beat of
-a track is spent still fading up.
-
-`visibility` flips to `hidden` only after the fade-out finishes, so the panel stops
-being composited and blurred once it is gone rather than sitting there invisible at
-`opacity: 0`. An unreachable daemon is deliberately exempt: that is an error state,
-not a quiet one, so the panel stays up with its `no audio daemon` message legible.
-
-**Battery.** The daemon only opens the audio device while a WebSocket client is
-attached, and the widget drops from `requestAnimationFrame` to a 250 ms tick once
-audio has been silent for `idleAfterMs`. A hidden or unloaded widget costs nothing.
-Bursts of silence do not wake the 60 fps loop either; if they did it would wake and
-sleep again ten times a second for a paused source.
+See [DESIGN-NOTES.md](DESIGN-NOTES.md).
 
 ## Troubleshooting
 
