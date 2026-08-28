@@ -494,14 +494,6 @@ Daemon options:
 --verbose               log frame rates and raw dB ranges
 ```
 
-## Design notes
-
-Why the daemon and the widget are built the way they are: the AUHAL capture path and the
-aggregate-device bug behind it, the watchdog that catches a tap which stops delivering
-without ever failing, how frames are sized and normalized, and how the panel fades.
-
-See [DESIGN-NOTES.md](DESIGN-NOTES.md).
-
 ## Troubleshooting
 
 | Symptom | Check |
