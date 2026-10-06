@@ -133,11 +133,22 @@ what the device happens to be called here; if you named yours `Loopback Audio` o
 then substring, so `--device "Loopback"` finds `Loopback Audio`. Step 3 lists the
 names available.
 
-Approve the microphone prompt the first time. To start it automatically at login:
+To start it automatically at login:
 
 ```sh
 ./lib/install-agent.sh "Music"      # remove with --uninstall
 ```
+
+Approve the microphone prompt the first time.
+
+> **Run by hand, the microphone permission belongs to your terminal.** macOS
+> attributes a process started from a shell to the app that launched it (Terminal,
+> iTerm, VS Code and so on), so it is *that app* that needs Microphone access, not
+> `visualizerd`. If it doesn't have it, you get the same silent failure described
+> under step 2: capture starts, and every band reads 0. Either switch the launching
+> app on in **System Settings > Privacy & Security > Microphone** (then quit and
+> reopen it), or use `install-agent.sh`, which runs the daemon on its own and gives
+> `visualizerd` its own grant.
 
 ### 5. Point the widget at it
 
@@ -499,7 +510,7 @@ Daemon options:
 | Symptom | Check |
 |---|---|
 | Panel says `no audio daemon` | Is the daemon running? `lsof -nP -iTCP:41500 -sTCP:LISTEN` |
-| Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the device is receiving silence, so the virtual device is not getting that app's audio. Check the app you are playing from is actually one of the device's sources: adding Music.app does nothing for Spotify, and vice versa |
+| Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the daemon is receiving silence. Either it has no microphone permission (if you started it from a terminal, that terminal app needs Microphone access; see step 4), or the virtual device is not getting that app's audio. For Loopback, check the app you are playing from is actually one of the device's sources: adding Music.app does nothing for Spotify, and vice versa. For BlackHole, the Multi-Output Device must include BlackHole and be the selected system output |
 | You cannot hear your music | Loopback has a per-source **"Mute when captured"** option; turn it off. Also confirm the device has a Monitor pointing at your real output (step 1) |
 | Widget invisible but connected | `layout-controller.widget` is positioning it; see [Placement](#placement) |
 | Suspect the DSP | `./lib/visualizerd --selftest` renders a 1 kHz tone and asserts it lands in the right band |
