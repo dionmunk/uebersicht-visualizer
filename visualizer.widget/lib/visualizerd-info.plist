@@ -23,5 +23,9 @@
 	     cannot do this work: Übersicht.app ships no microphone usage string. -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>The Übersicht visualizer widget reads the audio loopback device to draw a spectrum of what is currently playing.</string>
+	<!-- Required for --system and --apps (CoreAudio process taps, macOS 14.2+). This is
+	     the "System Audio Recording" permission, separate from the microphone one. -->
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>The Übersicht visualizer widget reads what your Mac is playing to draw a spectrum of it. Nothing is recorded or stored.</string>
 </dict>
 </plist>

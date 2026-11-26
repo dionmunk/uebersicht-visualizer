@@ -5,9 +5,11 @@
 // License: Creative Commons Attribution-NonCommercial 4.0 International
 //          (CC BY-NC 4.0). See LICENSE at the repository root.
 //
-// Taps a CoreAudio *input* device (normally a Loopback/BlackHole virtual device
-// fed by Music.app), runs an FFT over the samples, and broadcasts normalized
-// band levels as JSON over a loopback-only WebSocket. The widget just draws.
+// Captures audio, runs an FFT over the samples, and broadcasts normalized band
+// levels as JSON over a loopback-only WebSocket. The widget just draws. Audio comes
+// either from a CoreAudio *input* device (a Loopback/BlackHole virtual device fed by
+// Music.app), or, on macOS 14.2+, straight from what apps are playing through a
+// process tap, with no virtual device in the path (--system, --apps).
 //
 // This exists because Übersicht's WebKit view cannot call getUserMedia: the app
 // bundle carries no NSMicrophoneUsageDescription and does not implement the
@@ -16,6 +18,8 @@
 //
 //   visualizerd --list                 # show input-capable devices
 //   visualizerd --device "Loopback Audio" --port 41417 --bands 32
+//   visualizerd --system                                     # everything playing
+//   visualizerd --apps com.apple.Music,com.spotify.client    # just these apps
 //
 // The audio engine only runs while at least one WebSocket client is connected,
 // so a hidden or unloaded widget costs nothing.
@@ -29,7 +33,24 @@ import AudioToolbox
 
 // MARK: - Configuration
 
+/// Where samples come from. `.device` is the original route: a virtual input device
+/// (Loopback, BlackHole) that something else feeds. The two tap modes need no driver at
+/// all: CoreAudio copies what apps are already playing, and the audio still reaches the
+/// real output untouched, so the volume keys and the output menu keep working.
+enum SourceMode {
+    case device
+    /// Everything the system plays, minus `Config.excludeBundles`.
+    case system
+    /// Only the apps in `Config.appBundles`.
+    case apps
+}
+
 struct Config {
+    var source = SourceMode.device
+    /// Bundle IDs to include under `--apps`, and to leave out under `--system
+    /// --exclude`. Both match exactly or as a dotted prefix, see `bundleMatches`.
+    var appBundles: [String] = []
+    var excludeBundles: [String] = []
     var deviceName = "Music"
     // 41416 is Übersicht's HTTP server and 41417 is its widget-push socket, so
     // this deliberately sits clear of that pair.
@@ -127,6 +148,13 @@ func parseArgs() -> Config {
             if let v = it.next(), let n = Double(v) { c.simulateStallAfter = n }
         case "--device", "-d":
             if let v = it.next() { c.deviceName = v }
+        case "--system":
+            c.source = .system
+        case "--apps":
+            c.source = .apps
+            if let v = it.next() { c.appBundles = splitList(v) }
+        case "--exclude":
+            if let v = it.next() { c.excludeBundles = splitList(v) }
         case "--port", "-p":
             if let v = it.next(), let n = UInt16(v) { c.port = n }
         case "--bands", "-b":
@@ -156,6 +184,12 @@ func parseArgs() -> Config {
               --selftest              push a synthetic tone through the analyzer
                                       and print the result (no device, no TCC)
               --device, -d <name>     input device to tap (default: Music)
+              --system                capture everything the Mac plays, no virtual
+                                      device needed (macOS 14.2+)
+              --apps <ids>            capture only these apps, comma-separated
+                                      bundle IDs, e.g. com.apple.Music,com.spotify.client
+                                      (macOS 14.2+; --list shows the IDs)
+              --exclude <ids>         with --system, leave these apps out
               --port, -p <n>          WebSocket port (default: 41500)
               --bands, -b <n>         number of frequency bands (default: 32)
               --scope <n>             oscilloscope points per frame, 0 disables
@@ -172,7 +206,19 @@ func parseArgs() -> Config {
             break
         }
     }
+    if c.source != .system && !c.excludeBundles.isEmpty {
+        FileHandle.standardError.write("visualizerd: --exclude only applies with --system\n".data(using: .utf8)!)
+        exit(2)
+    }
+    if c.source == .apps && c.appBundles.isEmpty {
+        FileHandle.standardError.write("visualizerd: --apps needs at least one bundle ID\n".data(using: .utf8)!)
+        exit(2)
+    }
     return c
+}
+
+func splitList(_ s: String) -> [String] {
+    s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
 }
 
 // MARK: - CoreAudio device enumeration
@@ -840,6 +886,154 @@ final class Capture {
     }
 }
 
+// MARK: - Process taps (no virtual device)
+
+/// A process CoreAudio knows about. Only processes that have opened audio appear, and
+/// one app can be several of these: Chrome plays from `com.google.Chrome.helper`, not
+/// from `com.google.Chrome`.
+struct AudioProcess {
+    let id: AudioObjectID
+    let pid: pid_t
+    let bundleID: String
+    /// True while it is actually sending audio to an output.
+    let isOutputting: Bool
+}
+
+private func processProperty<T: FixedWidthInteger>(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                                _ value: inout T) -> Bool {
+    var addr = AudioObjectPropertyAddress(mSelector: selector,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var size = UInt32(MemoryLayout<T>.size)
+    return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr
+}
+
+func audioProcesses() -> [AudioProcess] {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.map { id in
+        var pid: pid_t = -1
+        _ = processProperty(id, kAudioProcessPropertyPID, &pid)
+        var running: UInt32 = 0
+        _ = processProperty(id, kAudioProcessPropertyIsRunningOutput, &running)
+        return AudioProcess(id: id, pid: pid,
+                            bundleID: deviceString(id, kAudioProcessPropertyBundleID) ?? "",
+                            isOutputting: running != 0)
+    }
+}
+
+/// Exact, or `wanted` followed by a dot, so `com.google.Chrome` also takes in
+/// `com.google.Chrome.helper` (where Chrome's audio really comes from) without
+/// `com.apple.Music` swallowing some unrelated `com.apple.MusicFoo`. Case-insensitive.
+func bundleMatches(_ bundleID: String, _ wanted: [String]) -> Bool {
+    let b = bundleID.lowercased()
+    return wanted.contains { w in
+        let w = w.lowercased()
+        return b == w || b.hasPrefix(w + ".")
+    }
+}
+
+/// The process objects a tap should name for this config: the apps to include under
+/// `--apps`, the apps to leave out under `--system`. Sorted, so two calls can be
+/// compared to see whether the set moved.
+func tapTargets(_ cfg: Config) -> [AudioObjectID] {
+    let wanted = cfg.source == .apps ? cfg.appBundles : cfg.excludeBundles
+    guard !wanted.isEmpty else { return [] }
+    return audioProcesses().filter { bundleMatches($0.bundleID, wanted) }.map { $0.id }.sorted()
+}
+
+/// A CoreAudio process tap wrapped in a private aggregate device, which is how a tap is
+/// read: the aggregate exposes the tapped audio as an ordinary input stream. That makes
+/// the result a plain `Device` the existing AUHAL `Capture` can pin to, so the analyzer,
+/// the socket and the watchdog do not know or care that no virtual device is involved.
+///
+/// The tap is unmuted, so the tapped apps keep playing through the real output exactly as
+/// before. That is the whole point: a virtual device has to *become* the output to see
+/// the audio, which takes the hardware volume control with it.
+///
+/// Two things here are deliberate:
+///
+/// - No `tapautostart`. With it, `AudioDeviceStart` blocks until a tapped process makes a
+///   sound, which would hang `Capture.start` whenever nothing is playing. Without it the
+///   tap runs from the start and delivers zero-filled buffers through silence, which also
+///   keeps the stall watchdog quiet: buffers never stop, so a quiet room is not a stall.
+/// - Processes are named by object ID, resolved fresh on every build, rather than through
+///   the bundle-ID list that macOS 26 added to `CATapDescription`. Those match exactly,
+///   so `com.google.Chrome` would hear nothing, and they do not exist before macOS 26.
+///   Apps that start or quit later are picked up by the watchdog, which rebuilds the tap
+///   when `tapTargets` changes.
+@available(macOS 14.2, *)
+final class ProcessTap {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    /// The process objects the live tap was built with, for the watchdog's comparison.
+    private(set) var targets: [AudioObjectID] = []
+
+    var isBuilt: Bool { aggregateID != kAudioObjectUnknown }
+
+    func build(_ cfg: Config, label: String) throws -> Device {
+        destroy()
+        let found = tapTargets(cfg)
+        let numbers = found.map { NSNumber(value: $0) }
+
+        let desc = cfg.source == .apps
+            ? CATapDescription(__stereoMixdownOfProcesses: numbers)
+            : CATapDescription(__stereoGlobalTapButExcludeProcesses: numbers)
+        desc.name = "visualizerd"
+        desc.uuid = UUID()
+        desc.isPrivate = true
+        desc.muteBehavior = .unmuted
+
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        let tapStatus = AudioHardwareCreateProcessTap(desc, &tap)
+        guard tapStatus == noErr else {
+            throw NSError(domain: "visualizerd", code: Int(tapStatus), userInfo: [
+                NSLocalizedDescriptionKey: "could not create the process tap (OSStatus \(tapStatus))"])
+        }
+        tapID = tap
+
+        let composition: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "visualizerd tap",
+            kAudioAggregateDeviceUIDKey: "local.uebersicht.visualizerd.tap.\(UUID().uuidString)",
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: false,
+            kAudioAggregateDeviceTapListKey: [[
+                kAudioSubTapUIDKey: desc.uuid.uuidString,
+                kAudioSubTapDriftCompensationKey: true,
+            ]],
+        ]
+        var agg = AudioObjectID(kAudioObjectUnknown)
+        let aggStatus = AudioHardwareCreateAggregateDevice(composition as CFDictionary, &agg)
+        guard aggStatus == noErr else {
+            destroy()
+            throw NSError(domain: "visualizerd", code: Int(aggStatus), userInfo: [
+                NSLocalizedDescriptionKey: "could not create the tap's aggregate device (OSStatus \(aggStatus))"])
+        }
+        aggregateID = agg
+        targets = found
+        return Device(id: agg, name: label, channels: 2)
+    }
+
+    func destroy() {
+        if aggregateID != kAudioObjectUnknown {
+            AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != kAudioObjectUnknown {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
+        }
+        targets = []
+    }
+}
+
 // MARK: - Main
 
 let config = parseArgs()
@@ -854,6 +1048,15 @@ if config.listOnly {
             print(String(format: "  %-32s %d ch", (d.name as NSString).utf8String!, d.channels))
         }
     }
+    // For --apps and --exclude. Only processes that have opened audio are listed, and an
+    // app's sound often comes from a helper, so this is the list to copy IDs from.
+    let apps = Dictionary(grouping: audioProcesses().filter { !$0.bundleID.isEmpty },
+                          by: { $0.bundleID })
+        .map { (id: $0.key, playing: $0.value.contains { $0.isOutputting }) }
+        .sorted { ($0.playing ? 0 : 1, $0.id.lowercased()) < ($1.playing ? 0 : 1, $1.id.lowercased()) }
+    print("\nApps with audio (bundle IDs for --apps / --exclude, macOS 14.2+):")
+    if apps.isEmpty { print("  (none)") }
+    for app in apps { print("  \(app.playing ? "playing" : "       ")  \(app.id)") }
     exit(0)
 }
 
@@ -924,9 +1127,38 @@ if config.selfTest {
     exit(inBand ? 0 : 1)
 }
 
+/// What the greeting and the log call the source. In the tap modes there is no device
+/// name to show, so it describes what is being captured instead.
+let sourceLabel: String = {
+    switch config.source {
+    case .device: return config.deviceName
+    case .system: return config.excludeBundles.isEmpty
+        ? "System audio" : "System audio except \(config.excludeBundles.joined(separator: ", "))"
+    case .apps: return config.appBundles.joined(separator: ", ")
+    }
+}()
+
+if config.source != .device {
+    guard #available(macOS 14.2, *) else {
+        FileHandle.standardError.write("""
+        visualizerd: --system and --apps need macOS 14.2 or later. On older systems, \
+        route audio through a virtual device and use --device.
+
+        """.data(using: .utf8)!)
+        exit(2)
+    }
+}
+
+/// Holds the live tap in the tap modes. Typed loosely so the declaration itself does not
+/// need macOS 14.2; every use sits behind an availability check.
+var processTap: AnyObject?
+
 // Mutable because the watchdog re-resolves it: a device ID is not stable across an
-// audio-stack re-enumeration, but the name the user configured is.
-guard var device = findDevice(named: config.deviceName) else {
+// audio-stack re-enumeration, but the name the user configured is. In the tap modes this
+// is a placeholder until capture builds the tap's aggregate device.
+guard var device = config.source != .device
+        ? Device(id: AudioObjectID(kAudioObjectUnknown), name: sourceLabel, channels: 2)
+        : findDevice(named: config.deviceName) else {
     let available = inputDevices().map { "  \($0.name)" }.joined(separator: "\n")
     FileHandle.standardError.write("""
     visualizerd: no input device matching '\(config.deviceName)'.
@@ -1022,12 +1254,32 @@ func startCapture(_ note: String = "") -> Bool {
     // then succeed against the wrong hardware: a microphone, most likely, since those
     // outlive a virtual device across a re-enumeration. Better to report it missing and
     // let the watchdog try again.
-    guard let fresh = findDevice(named: config.deviceName) else {
-        FileHandle.standardError.write(
-            "visualizerd: device '\(config.deviceName)' is not present right now\n".data(using: .utf8)!)
-        return false
+    if config.source != .device, #available(macOS 14.2, *) {
+        // Rebuilt from scratch every time, never reused: a restart is exactly when the
+        // set of apps, or the audio stack under the old aggregate, may have changed.
+        let tap = (processTap as? ProcessTap) ?? ProcessTap()
+        processTap = tap
+        do {
+            device = try tap.build(config, label: sourceLabel)
+        } catch {
+            FileHandle.standardError.write("visualizerd: capture failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+            return false
+        }
+        if config.source == .apps && tap.targets.isEmpty {
+            FileHandle.standardError.write("""
+            visualizerd: none of \(config.appBundles.joined(separator: ", ")) has audio open yet, \
+            waiting for one to start
+
+            """.data(using: .utf8)!)
+        }
+    } else {
+        guard let fresh = findDevice(named: config.deviceName) else {
+            FileHandle.standardError.write(
+                "visualizerd: device '\(config.deviceName)' is not present right now\n".data(using: .utf8)!)
+            return false
+        }
+        device = fresh
     }
-    device = fresh
     do {
         try capture.start(device: device) { samples, frames, rate in
             let batch = analyzer.feed(samples, count: frames, sampleRate: rate)
@@ -1046,8 +1298,16 @@ func startCapture(_ note: String = "") -> Bool {
         return true
     } catch {
         FileHandle.standardError.write("visualizerd: capture failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+        stopCapture()
         return false
     }
+}
+
+/// Stop capture and, in the tap modes, tear the tap down with it. A tap left standing
+/// would keep a private aggregate device alive for no reader.
+func stopCapture() {
+    capture.stop()
+    if #available(macOS 14.2, *) { (processTap as? ProcessTap)?.destroy() }
 }
 
 server.onClientCountChanged = { count in
@@ -1055,7 +1315,7 @@ server.onClientCountChanged = { count in
     if count > 0 && !capture.isRunning {
         startCapture()
     } else if count == 0 && capture.isRunning {
-        capture.stop()
+        stopCapture()
         FileHandle.standardError.write("visualizerd: capture stopped (no clients)\n".data(using: .utf8)!)
     }
 }
@@ -1063,7 +1323,7 @@ server.onClientCountChanged = { count in
 server.onReady = {
     FileHandle.standardError.write("""
     visualizerd: listening on ws://127.0.0.1:\(config.port)
-    visualizerd: device '\(device.name)' (\(device.channels) ch), \(config.bandCount) bands
+    visualizerd: \(config.source == .device ? "device '\(device.name)' (\(device.channels) ch)" : "source: \(sourceLabel)"), \(config.bandCount) bands
     visualizerd: idle until a client connects
 
     """.data(using: .utf8)!)
@@ -1165,7 +1425,7 @@ watchdog.setEventHandler {
     // Worse, CoreAudio reuses retired IDs, so the tap can end up on whatever takes the
     // number next. A microphone is the likely candidate, and then the visualizer quietly
     // starts watching the room instead of the music.
-    if capture.isRunning,
+    if config.source == .device, capture.isRunning,
        let current = findDevice(named: config.deviceName),
        current.id != device.id {
         FileHandle.standardError.write("""
@@ -1173,11 +1433,30 @@ watchdog.setEventHandler {
         restarting capture
 
         """.data(using: .utf8)!)
-        capture.stop()
+        stopCapture()
         startCapture(" after the device moved")
         watchdogLastCallbacks = capture.tapCallbacks
         watchdogStalledFor = 0
         return
+    }
+
+    // The tap equivalent of a device moving: the apps it names came or went. A tap holds
+    // process objects, not bundle IDs, so an app launched after the tap was built is not
+    // in it, and one that quit leaves a dead entry. `--system` with nothing excluded names
+    // no processes and never needs this.
+    if config.source != .device, capture.isRunning, #available(macOS 14.2, *),
+       let tap = processTap as? ProcessTap {
+        let now = tapTargets(config)
+        if now != tap.targets {
+            FileHandle.standardError.write(
+                "visualizerd: tapped apps changed (\(tap.targets.count) -> \(now.count) processes), rebuilding the tap\n"
+                .data(using: .utf8)!)
+            stopCapture()
+            startCapture(" after the apps changed")
+            watchdogLastCallbacks = capture.tapCallbacks
+            watchdogStalledFor = 0
+            return
+        }
     }
 
     // A fresh session starts the stall reckoning over, but deliberately does NOT hand
@@ -1237,7 +1516,7 @@ watchdog.setEventHandler {
     """.data(using: .utf8)!)
     watchdogStalledFor = 0
     watchdogGrace = min(watchdogGraceCeiling, watchdogGrace * 2)
-    capture.stop()
+    stopCapture()
     startCapture(" after a stall")
     watchdogLastCallbacks = capture.tapCallbacks
 }

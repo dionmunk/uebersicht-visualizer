@@ -96,6 +96,48 @@ is genuinely gone costs one log line a minute rather than one every few seconds.
 `--simulate-stall <sec>` pulls the tap while leaving the unit up and `isRunning`, reproducing
 the failure exactly so the whole path can be exercised on demand.
 
+### Process taps: capture with no virtual device
+
+`--system` and `--apps` read audio through a CoreAudio process tap (macOS 14.2+) instead of
+an input device. A tap is unmuted by default, so the tapped apps keep playing through the
+real output: nothing about routing changes, and the hardware volume keys keep working. That
+is the reason the mode exists. A virtual device can only see audio by becoming the output,
+and BlackHole's Multi-Output Device takes the volume control away with it.
+
+A tap is read through a private aggregate device that lists it under
+`kAudioAggregateDeviceTapListKey`, which presents the tapped audio as an ordinary input
+stream. That aggregate is handed to the same AUHAL `Capture` as a real device would be, so
+the analyzer, the socket, the post-start `IsRunningSomewhere` check and the stall watchdog
+are all shared, and none of them know which mode is running.
+
+Three decisions worth knowing before changing it:
+
+- **No `tapautostart`.** With it, starting the aggregate blocks until a tapped app makes a
+  sound, which would hang `Capture.start` whenever nothing is playing. Without it the tap
+  runs from the start and delivers zero-filled buffers through silence, at the normal rate
+  (measured: ~94 buffers/s with nothing to tap). Unlike an idle virtual device, a quiet tap
+  therefore never looks like a stall.
+- **Processes by object ID, not bundle ID.** macOS 26 added `bundleIDs` and
+  `processRestoreEnabled` to `CATapDescription`, which would follow an app across quit and
+  relaunch natively. They match exactly, though, and much of the audio people want comes
+  from helpers: a `com.google.Chrome` bundle tap hears nothing, because Chrome plays from
+  `com.google.Chrome.helper`. They also do not exist before macOS 26. So the daemon resolves
+  the configured IDs (exact, or as a dotted prefix) against
+  `kAudioHardwarePropertyProcessObjectList` itself.
+- **The watchdog rebuilds the tap when the matched processes change.** A tap names process
+  objects, so an app launched after it was built is not in it. On every tick the watchdog
+  re-resolves the set and, if it moved, tears the tap down and builds a new one. That is
+  the tap equivalent of the device-ID check above. Measured: a player launched with the
+  daemon already capturing was in the stream about 1.5 s later.
+
+`--system` taps everything, including Rogue Amoeba's `arkaudiod`, which plays Loopback's
+monitors. With Loopback in use the same audio can arrive twice, once from the app and once
+from the monitor, hence the README's advice to `--exclude com.rogueamoeba.arkaudiod`.
+
+Permission is **System Audio Recording** (`NSAudioCaptureUsageDescription`,
+`kTCCServiceAudioCapture`), separate from the microphone. As with the microphone, a process
+started from a shell is attributed to the terminal app.
+
 ## Analysis
 
 ### Callback sizes are not ours to choose

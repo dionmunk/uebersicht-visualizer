@@ -12,14 +12,15 @@ music itself. It also tells the difference between silence and a paused source, 
 fades away when the music stops and comes back when it starts.
 
 ```
-Music.app  ┐
-Spotify    ├─▶ Loopback virtual device ──▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
-any player ┘                               (Swift, FFT)                              (jitter buffer)
+Music.app  ┐   macOS 14.2+: process tap, no driver ┐
+Spotify    ├─▶                                      ├─▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
+any player ┘   or: Loopback / BlackHole device ────┘   (Swift, FFT)                              (jitter buffer)
 ```
 
-Any app that makes sound can feed it. The daemon taps the virtual device, not an
-application, so Music.app, Spotify and anything else are all supported by adding each
-as a source on that device (see [Setup](#setup)).
+Any app that makes sound can feed it. On macOS 14.2 and later the daemon can read
+what apps are playing directly, with no virtual audio device at all: everything, or
+just the apps you name. On older systems, or if you already route audio through
+Loopback or BlackHole, it taps a virtual device instead (see [Setup](#setup)).
 
 ## A companion to the Music widget
 
@@ -50,7 +51,36 @@ it sidesteps the problem entirely. The widget never touches audio; it only draws
 
 ## Setup
 
-### 1. Route audio into a virtual device
+### 1. Choose where the audio comes from
+
+There are two routes. Pick one.
+
+#### Option A: no virtual device (macOS 14.2+, recommended)
+
+Nothing to install or route. The daemon uses a CoreAudio *process tap*, which copies
+what apps are already playing while the audio carries on to your speakers exactly as
+before. Your output device, its volume keys and the sound menu are all left alone,
+which is the usual complaint about the virtual-device route: once a BlackHole
+Multi-Output Device is your output, the volume keys stop working.
+
+Choose at step 4 between:
+
+- `--system`: everything the Mac plays. Notification sounds and browser tabs included.
+- `--apps <bundle IDs>`: only the apps you name, e.g.
+  `--apps com.apple.Music,com.spotify.client`. Apps can be closed when the daemon
+  starts; it picks each one up within a couple of seconds of it opening audio, and
+  drops it again when it quits.
+
+`./lib/visualizerd --list` prints the bundle IDs of every app that currently has
+audio open, with the ones making sound marked `playing`. Use that list: an app's
+sound often comes from a helper process rather than the app itself (Chrome plays from
+`com.google.Chrome.helper`). An ID also matches anything under it, so
+`com.google.Chrome` covers its helpers.
+
+The first time the daemon captures this way, macOS asks for **System Audio Recording**
+permission. Approve it. Skip to [step 2](#2-build-the-daemon).
+
+#### Option B: a virtual device
 
 Create a virtual device in [Loopback](https://rogueamoeba.com/loopback/) (or
 [BlackHole](https://github.com/ExistentialAudio/BlackHole), which is free) and add
@@ -86,7 +116,9 @@ the two widgets cover the same players.
 
 This compiles `lib/visualizerd.swift`, links `lib/visualizerd-info.plist` into the
 binary as a `__TEXT,__info_plist` section, and ad-hoc signs it with a stable
-identifier so the microphone grant persists across runs.
+identifier so its permission grants persist across runs. The plist carries both usage
+strings: microphone access for a virtual device (option B), and System Audio Recording
+for the process tap (option A).
 
 The plist is deliberately not named `Info.plist`: codesign treats any directory
 containing one as a bundle, and would sign all of `lib/` with a sealed resource
@@ -105,7 +137,11 @@ directory that goes invalid whenever anything else in there changes.
 > `tccutil reset Microphone` would clear every app on the machine. Fix it by hand in
 > **System Settings > Privacy & Security > Microphone**, switching `visualizerd` back on.
 >
-> To check the state directly:
+> The process tap (option A) has its own permission, listed under **System Settings >
+> Privacy & Security > Screen & System Audio Recording**, in the **System Audio
+> Recording Only** section. The same advice applies there after a rebuild.
+>
+> To check the microphone state directly:
 >
 > ```sh
 > sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
@@ -115,7 +151,7 @@ directory that goes invalid whenever anything else in there changes.
 >
 > `2` is allowed, `0` is denied. Requires Full Disk Access for the calling terminal.
 
-### 3. Check it can see the device
+### 3. Check it can see the device or apps
 
 ```sh
 ./lib/visualizerd --list
@@ -124,8 +160,14 @@ directory that goes invalid whenever anything else in there changes.
 ### 4. Run it
 
 ```sh
-./lib/visualizerd --device "Music"
+./lib/visualizerd --system                                    # option A, everything
+./lib/visualizerd --apps com.apple.Music,com.spotify.client   # option A, just these
+./lib/visualizerd --device "Music"                            # option B
 ```
+
+With `--system`, `--exclude <bundle IDs>` leaves apps out. If you also run Loopback,
+add `--exclude com.rogueamoeba.arkaudiod`: Loopback plays its devices' monitors
+through its own process, and the tap would otherwise hear that audio twice.
 
 `--device` names the **virtual device** from step 1, not an app. `"Music"` is just
 what the device happens to be called here; if you named yours `Loopback Audio` or
@@ -136,12 +178,19 @@ names available.
 To start it automatically at login:
 
 ```sh
-./lib/install-agent.sh "Music"      # remove with --uninstall
+./lib/install-agent.sh --apps com.apple.Music,com.spotify.client   # option A
+./lib/install-agent.sh --system                                    # option A
+./lib/install-agent.sh "Music"                                     # option B
+./lib/install-agent.sh --uninstall
 ```
 
-Approve the microphone prompt the first time.
+Anything starting with `--` is passed to the daemon as-is, so any option below works
+here too.
 
-> **Run by hand, the microphone permission belongs to your terminal.** macOS
+Approve the permission prompt the first time (System Audio Recording for option A,
+the microphone for option B).
+
+> **Run by hand, the permission belongs to your terminal.** macOS
 > attributes a process started from a shell to the app that launched it (Terminal,
 > iTerm, VS Code and so on), so it is *that app* that needs Microphone access, not
 > `visualizerd`. If it doesn't have it, you get the same silent failure described
@@ -530,8 +579,14 @@ album art.
 Daemon options:
 
 ```
---list                  list input-capable devices
+--list                  list input-capable devices, and the bundle IDs of apps
+                        with audio open
 --selftest              push a synthetic 1 kHz tone through the analyzer
+--system                capture everything the Mac plays, no virtual device
+                        (macOS 14.2+)
+--apps <ids>            capture only these apps: comma-separated bundle IDs,
+                        exact or as a prefix (macOS 14.2+)
+--exclude <ids>         with --system, leave these apps out
 --device <name>         virtual input device to tap, not an app name; matched
                         case-insensitively, exact then substring (default: Music)
 --port <n>              WebSocket port (default: 41500)
@@ -554,6 +609,8 @@ Daemon options:
 |---|---|
 | Panel says `no audio daemon` | Is the daemon running? `lsof -nP -iTCP:41500 -sTCP:LISTEN` |
 | Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the daemon is receiving silence. Either it has no microphone permission (if you started it from a terminal, that terminal app needs Microphone access; see step 4), or the virtual device is not getting that app's audio. For Loopback, check the app you are playing from is actually one of the device's sources: adding Music.app does nothing for Spotify, and vice versa. For BlackHole, the Multi-Output Device must include BlackHole and be the selected system output |
+| Bars flat with `--system` or `--apps` | Check **System Audio Recording** is on for `visualizerd` (or for your terminal, if you ran it by hand) under Privacy & Security > Screen & System Audio Recording. With `--apps`, check the IDs against `./lib/visualizerd --list` while the app is playing: the sound may come from a helper process, and the log says `waiting for one to start` when nothing matched |
+| Everything looks twice as loud with `--system` | Loopback is replaying audio through its monitors; add `--exclude com.rogueamoeba.arkaudiod` |
 | You cannot hear your music | Loopback has a per-source **"Mute when captured"** option; turn it off. Also confirm the device has a Monitor pointing at your real output (step 1) |
 | Widget invisible but connected | `layout-controller.widget` is positioning it; see [Placement](#placement) |
 | Suspect the DSP | `./lib/visualizerd --selftest` renders a 1 kHz tone and asserts it lands in the right band |

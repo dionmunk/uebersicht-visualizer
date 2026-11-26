@@ -8,6 +8,8 @@
 #   1. Info.plist is linked into the binary as a __TEXT,__info_plist section.
 #      A bare executable has nowhere else to declare NSMicrophoneUsageDescription,
 #      and without that key macOS kills the process on first audio-device access.
+#      It also carries NSAudioCaptureUsageDescription, the "System Audio Recording"
+#      permission that --system and --apps (process taps) need instead.
 #
 #   2. The binary is ad-hoc signed with a stable identifier. TCC keys the
 #      microphone grant to the code signature, so an unsigned binary gets asked
