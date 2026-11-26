@@ -12,14 +12,15 @@ music itself. It also tells the difference between silence and a paused source, 
 fades away when the music stops and comes back when it starts.
 
 ```
-Music.app  ┐
-Spotify    ├─▶ Loopback virtual device ──▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
-any player ┘                               (Swift, FFT)                              (jitter buffer)
+Music.app  ┐   macOS 14.2+: process tap, no driver ┐
+Spotify    ├─▶                                      ├─▶ visualizerd ──▶ ws://127.0.0.1:41500 ──▶ widget canvas
+any player ┘   or: Loopback / BlackHole device ────┘   (Swift, FFT)                              (jitter buffer)
 ```
 
-Any app that makes sound can feed it. The daemon taps the virtual device, not an
-application, so Music.app, Spotify and anything else are all supported by adding each
-as a source on that device (see [Setup](#setup)).
+Any app that makes sound can feed it. On macOS 14.2 and later the daemon can read
+what apps are playing directly, with no virtual audio device at all: everything, or
+just the apps you name. On older systems, or if you already route audio through
+Loopback or BlackHole, it taps a virtual device instead (see [Setup](#setup)).
 
 ## A companion to the Music widget
 
@@ -50,7 +51,36 @@ it sidesteps the problem entirely. The widget never touches audio; it only draws
 
 ## Setup
 
-### 1. Route audio into a virtual device
+### 1. Choose where the audio comes from
+
+There are two routes. Pick one.
+
+#### Option A: no virtual device (macOS 14.2+, recommended)
+
+Nothing to install or route. The daemon uses a CoreAudio *process tap*, which copies
+what apps are already playing while the audio carries on to your speakers exactly as
+before. Your output device, its volume keys and the sound menu are all left alone,
+which is the usual complaint about the virtual-device route: once a BlackHole
+Multi-Output Device is your output, the volume keys stop working.
+
+Choose at step 4 between:
+
+- `--system`: everything the Mac plays. Notification sounds and browser tabs included.
+- `--apps <bundle IDs>`: only the apps you name, e.g.
+  `--apps com.apple.Music,com.spotify.client`. Apps can be closed when the daemon
+  starts; it picks each one up within a couple of seconds of it opening audio, and
+  drops it again when it quits.
+
+`./lib/visualizerd --list` prints the bundle IDs of every app that currently has
+audio open, with the ones making sound marked `playing`. Use that list: an app's
+sound often comes from a helper process rather than the app itself (Chrome plays from
+`com.google.Chrome.helper`). An ID also matches anything under it, so
+`com.google.Chrome` covers its helpers.
+
+The first time the daemon captures this way, macOS asks for **System Audio Recording**
+permission. Approve it. Skip to [step 2](#2-build-the-daemon).
+
+#### Option B: a virtual device
 
 Create a virtual device in [Loopback](https://rogueamoeba.com/loopback/) (or
 [BlackHole](https://github.com/ExistentialAudio/BlackHole), which is free) and add
@@ -86,7 +116,9 @@ the two widgets cover the same players.
 
 This compiles `lib/visualizerd.swift`, links `lib/visualizerd-info.plist` into the
 binary as a `__TEXT,__info_plist` section, and ad-hoc signs it with a stable
-identifier so the microphone grant persists across runs.
+identifier so its permission grants persist across runs. The plist carries both usage
+strings: microphone access for a virtual device (option B), and System Audio Recording
+for the process tap (option A).
 
 The plist is deliberately not named `Info.plist`: codesign treats any directory
 containing one as a bundle, and would sign all of `lib/` with a sealed resource
@@ -105,7 +137,11 @@ directory that goes invalid whenever anything else in there changes.
 > `tccutil reset Microphone` would clear every app on the machine. Fix it by hand in
 > **System Settings > Privacy & Security > Microphone**, switching `visualizerd` back on.
 >
-> To check the state directly:
+> The process tap (option A) has its own permission, listed under **System Settings >
+> Privacy & Security > Screen & System Audio Recording**, in the **System Audio
+> Recording Only** section. The same advice applies there after a rebuild.
+>
+> To check the microphone state directly:
 >
 > ```sh
 > sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
@@ -115,7 +151,7 @@ directory that goes invalid whenever anything else in there changes.
 >
 > `2` is allowed, `0` is denied. Requires Full Disk Access for the calling terminal.
 
-### 3. Check it can see the device
+### 3. Check it can see the device or apps
 
 ```sh
 ./lib/visualizerd --list
@@ -124,8 +160,14 @@ directory that goes invalid whenever anything else in there changes.
 ### 4. Run it
 
 ```sh
-./lib/visualizerd --device "Music"
+./lib/visualizerd --system                                    # option A, everything
+./lib/visualizerd --apps com.apple.Music,com.spotify.client   # option A, just these
+./lib/visualizerd --device "Music"                            # option B
 ```
+
+With `--system`, `--exclude <bundle IDs>` leaves apps out. If you also run Loopback,
+add `--exclude com.rogueamoeba.arkaudiod`: Loopback plays its devices' monitors
+through its own process, and the tap would otherwise hear that audio twice.
 
 `--device` names the **virtual device** from step 1, not an app. `"Music"` is just
 what the device happens to be called here; if you named yours `Loopback Audio` or
@@ -136,12 +178,19 @@ names available.
 To start it automatically at login:
 
 ```sh
-./lib/install-agent.sh "Music"      # remove with --uninstall
+./lib/install-agent.sh --apps com.apple.Music,com.spotify.client   # option A
+./lib/install-agent.sh --system                                    # option A
+./lib/install-agent.sh "Music"                                     # option B
+./lib/install-agent.sh --uninstall
 ```
 
-Approve the microphone prompt the first time.
+Anything starting with `--` is passed to the daemon as-is, so any option below works
+here too.
 
-> **Run by hand, the microphone permission belongs to your terminal.** macOS
+Approve the permission prompt the first time (System Audio Recording for option A,
+the microphone for option B).
+
+> **Run by hand, the permission belongs to your terminal.** macOS
 > attributes a process started from a shell to the app that launched it (Terminal,
 > iTerm, VS Code and so on), so it is *that app* that needs Microphone access, not
 > `visualizerd`. If it doesn't have it, you get the same silent failure described
@@ -291,7 +340,7 @@ pane down to bottom), 18–22 oscilloscope, 23 peak marker. The defaults in
 `index.coffee` are the stock ramp. Paste any other skin's values into the `VISCOLOR`
 block to reskin it.
 
-Only the spectrum and the peak marker are taken from a skin. The backdrop dots and the
+Only the spectrum, the oscilloscope ramp and the peak marker are taken from a skin. The backdrop dots and the
 pane behind them are transcribed for completeness but not drawn: the dots always use
 the theme's neutral (below) and the pane is this collection's own panel, or nothing at
 all.
@@ -375,7 +424,7 @@ blunt exactly the snap the look depends on.
 **The steps are per frame, not per second.** The original works in whole pixels of a
 16px pane per rendered frame, so its two falloff sliders are only meaningful against
 a fixed frame rate. The widget therefore runs its ballistics on a clock of its own
-(`visRefresh`, 60Hz) rather than off the repaint loop: a repaint spanning two ticks
+(`visRefresh`, 30Hz) rather than off the repaint loop: a repaint spanning two ticks
 runs both, one spanning none leaves the bars where they are. Scaling the steps by
 real elapsed time instead lands the bars on the same heights on average, but lets a
 row boundary be crossed at any moment in between, which under `line` (below) reads as
@@ -393,10 +442,14 @@ changing how fast anything on it moves:
 A peak starts at 3/256 pixels per frame and multiplies that velocity every frame, so
 it hangs for a beat and then plummets, rather than accelerating evenly under gravity.
 `analyzerFalloff: 3` and `peakFalloff: 2` are a fresh Winamp's defaults, and this
-widget's: a full-height bar falls to nothing in ~0.36s, its peak in ~0.87s.
+widget's. Because the steps are per frame, they run a notch slower here than in Winamp,
+which ticks at 60Hz: at this widget's 30Hz a full-height bar falls to nothing in
+~0.7s and its peak in ~1.7s. At 60Hz both halve.
 
-Winamp's own refresh-rate slider repeatedly halves its frame rate, so 30 / 15 / 7.5
-are the other authentic `visRefresh` values. Lower is chunkier.
+Winamp's own refresh-rate slider starts at 60 and halves from there, so 60 / 30 / 15 /
+7.5 are the authentic `visRefresh` values. This widget defaults to 30 for the
+oscilloscope's sake (see [The oscilloscope](#the-oscilloscope)). If you raise it, lower
+the two falloffs to keep the same cadence. Lower is chunkier.
 
 ### Colour modes
 
@@ -468,13 +521,50 @@ If it reads too sparse, lower `dbSpan` (48 takes dark from 26% to 16%) before to
 original's sits: on the waveform ahead of its FFT, so on an amplitude rather than a dB
 reading. Raising it moves the ceiling along with everything else and is rarely the fix.
 
+## The oscilloscope
+
+The other classic visualization: the waveform itself rather than its spectrum, drawn
+across the same pane. Set `visualization: "scope"` to switch to it (the default is
+`"analyzer"`).
+
+The daemon sends 75 points of waveform with every frame, which is the original pane's
+width in pixels and its one-sample-per-column scope. The widget draws exactly what
+arrives across whatever width it has, so `columns: 2` gives a wider trace rather than a
+finer one. Start the daemon with `--scope 150` if you want the detail instead.
+
+| Option | Default | |
+|---|---|---|
+| `scopeStyle` | `"lines"` | `"dots"` (one mark per column), `"lines"` (columns joined, the original's default) or `"solid"` (filled out from the centre line) |
+| `scopeSmooth` | `true` | Drops the original's 16-row quantisation and five-band colouring, for a curve and a gradient instead of a staircase. `false` is the faithful setting |
+| `scopeLineWidth` | `5` | Stroke width in px for `"lines"` with `scopeSmooth` on |
+| `scopeSmoothing` | `1` | Passes of a small low-pass filter over the points, to steady the aliasing the original's point sampling leaves in. `0` is the original. Past about 4 it draws the envelope rather than the wave |
+| `scopeDotSize` | `5` | Dot size in px for `"dots"`, or `"cell"` to fill the whole cell as the original does. Also the gap control: the gap is the column spacing minus this |
+| `scopeDotShape` | `"round"` | `"round"` or `"square"`, for numeric dot sizes |
+| `scopeGain` | `1` | Vertical gain, hard-clipped at the pane edges. `1` is the original's scaling, which needs a track peaking near -6 dBFS to fill the pane; 3 to 4 suits quieter modern masters |
+
+The trace is coloured from the skin's oscilloscope ramp, brightest on the centre line.
+Under the `theme` and `monochrome` schemes it uses the ink colour at stepped opacities
+instead, so it still reads as an oscilloscope rather than taking on the data-series
+hues.
+
+`visRefresh` matters more here than for the analyzer. Consecutive frames are not
+phase-locked to each other, so at 60 a second the trace does not travel, it seethes.
+30, the default, gives each frame long enough to read as a shape. That is the
+original's own remedy.
+
+If the panel says `daemon sends no waveform`, the daemon was built before the
+oscilloscope existed (or is running with `--scope 0`). Rebuild it with
+`./lib/build.sh`.
+
 ## Options
 
-Widget options live at the top of [`index.coffee`](index.coffee): `layoutMode`,
+Widget options live at the top of [`index.coffee`](index.coffee): `visualization`,
+`layoutMode`,
 position and size, `colorScheme` (`winamp` / `theme` / `monochrome`) and `monoRange`,
 `colorStyle` (`normal` / `fire` / `line`), `background`, `bandWidth`, `rows`,
 `barGap`, `vizRadius`, `dbSpan`, `gain`, peak markers, the falloff speeds,
-`visRefresh`, the fade options, and the jitter-buffer latency cap.
+`visRefresh`, the oscilloscope options (see above), the fade options, and the
+jitter-buffer latency cap.
 
 `vizRadius` (3) rounds the analyzer area itself, which is the canvas inside the
 panel's 10px padding rather than the panel. It is a canvas clip, not CSS
@@ -489,13 +579,21 @@ album art.
 Daemon options:
 
 ```
---list                  list input-capable devices
+--list                  list input-capable devices, and the bundle IDs of apps
+                        with audio open
 --selftest              push a synthetic 1 kHz tone through the analyzer
+--system                capture everything the Mac plays, no virtual device
+                        (macOS 14.2+)
+--apps <ids>            capture only these apps: comma-separated bundle IDs,
+                        exact or as a prefix (macOS 14.2+)
+--exclude <ids>         with --system, leave these apps out
 --device <name>         virtual input device to tap, not an app name; matched
                         case-insensitively, exact then substring (default: Music)
 --port <n>              WebSocket port (default: 41500)
 --fft <n>               FFT window, power of two (default: 2048)
 --bands <n>             frequency bands (default: 75, the classic band count)
+--scope <n>             oscilloscope points per frame, 0 leaves the waveform off
+                        the wire (default: 75)
 --simulate-stall <sec>  pull the tap that long after capture starts, to
                         exercise the watchdog
 --floor / --ceil <dB>   normalization window (default: -72 / -12)
@@ -511,6 +609,8 @@ Daemon options:
 |---|---|
 | Panel says `no audio daemon` | Is the daemon running? `lsof -nP -iTCP:41500 -sTCP:LISTEN` |
 | Bars flat while music plays | `--verbose`; if `raw dB` sits near -100 the daemon is receiving silence. Either it has no microphone permission (if you started it from a terminal, that terminal app needs Microphone access; see step 4), or the virtual device is not getting that app's audio. For Loopback, check the app you are playing from is actually one of the device's sources: adding Music.app does nothing for Spotify, and vice versa. For BlackHole, the Multi-Output Device must include BlackHole and be the selected system output |
+| Bars flat with `--system` or `--apps` | Check **System Audio Recording** is on for `visualizerd` (or for your terminal, if you ran it by hand) under Privacy & Security > Screen & System Audio Recording. With `--apps`, check the IDs against `./lib/visualizerd --list` while the app is playing: the sound may come from a helper process, and the log says `waiting for one to start` when nothing matched |
+| Everything looks twice as loud with `--system` | Loopback is replaying audio through its monitors; add `--exclude com.rogueamoeba.arkaudiod` |
 | You cannot hear your music | Loopback has a per-source **"Mute when captured"** option; turn it off. Also confirm the device has a Monitor pointing at your real output (step 1) |
 | Widget invisible but connected | `layout-controller.widget` is positioning it; see [Placement](#placement) |
 | Suspect the DSP | `./lib/visualizerd --selftest` renders a 1 kHz tone and asserts it lands in the right band |
