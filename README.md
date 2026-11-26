@@ -291,7 +291,7 @@ pane down to bottom), 18–22 oscilloscope, 23 peak marker. The defaults in
 `index.coffee` are the stock ramp. Paste any other skin's values into the `VISCOLOR`
 block to reskin it.
 
-Only the spectrum and the peak marker are taken from a skin. The backdrop dots and the
+Only the spectrum, the oscilloscope ramp and the peak marker are taken from a skin. The backdrop dots and the
 pane behind them are transcribed for completeness but not drawn: the dots always use
 the theme's neutral (below) and the pane is this collection's own panel, or nothing at
 all.
@@ -375,7 +375,7 @@ blunt exactly the snap the look depends on.
 **The steps are per frame, not per second.** The original works in whole pixels of a
 16px pane per rendered frame, so its two falloff sliders are only meaningful against
 a fixed frame rate. The widget therefore runs its ballistics on a clock of its own
-(`visRefresh`, 60Hz) rather than off the repaint loop: a repaint spanning two ticks
+(`visRefresh`, 30Hz) rather than off the repaint loop: a repaint spanning two ticks
 runs both, one spanning none leaves the bars where they are. Scaling the steps by
 real elapsed time instead lands the bars on the same heights on average, but lets a
 row boundary be crossed at any moment in between, which under `line` (below) reads as
@@ -393,10 +393,14 @@ changing how fast anything on it moves:
 A peak starts at 3/256 pixels per frame and multiplies that velocity every frame, so
 it hangs for a beat and then plummets, rather than accelerating evenly under gravity.
 `analyzerFalloff: 3` and `peakFalloff: 2` are a fresh Winamp's defaults, and this
-widget's: a full-height bar falls to nothing in ~0.36s, its peak in ~0.87s.
+widget's. Because the steps are per frame, they run a notch slower here than in Winamp,
+which ticks at 60Hz: at this widget's 30Hz a full-height bar falls to nothing in
+~0.7s and its peak in ~1.7s. At 60Hz both halve.
 
-Winamp's own refresh-rate slider repeatedly halves its frame rate, so 30 / 15 / 7.5
-are the other authentic `visRefresh` values. Lower is chunkier.
+Winamp's own refresh-rate slider starts at 60 and halves from there, so 60 / 30 / 15 /
+7.5 are the authentic `visRefresh` values. This widget defaults to 30 for the
+oscilloscope's sake (see [The oscilloscope](#the-oscilloscope)). If you raise it, lower
+the two falloffs to keep the same cadence. Lower is chunkier.
 
 ### Colour modes
 
@@ -468,13 +472,50 @@ If it reads too sparse, lower `dbSpan` (48 takes dark from 26% to 16%) before to
 original's sits: on the waveform ahead of its FFT, so on an amplitude rather than a dB
 reading. Raising it moves the ceiling along with everything else and is rarely the fix.
 
+## The oscilloscope
+
+The other classic visualization: the waveform itself rather than its spectrum, drawn
+across the same pane. Set `visualization: "scope"` to switch to it (the default is
+`"analyzer"`).
+
+The daemon sends 75 points of waveform with every frame, which is the original pane's
+width in pixels and its one-sample-per-column scope. The widget draws exactly what
+arrives across whatever width it has, so `columns: 2` gives a wider trace rather than a
+finer one. Start the daemon with `--scope 150` if you want the detail instead.
+
+| Option | Default | |
+|---|---|---|
+| `scopeStyle` | `"lines"` | `"dots"` (one mark per column), `"lines"` (columns joined, the original's default) or `"solid"` (filled out from the centre line) |
+| `scopeSmooth` | `true` | Drops the original's 16-row quantisation and five-band colouring, for a curve and a gradient instead of a staircase. `false` is the faithful setting |
+| `scopeLineWidth` | `5` | Stroke width in px for `"lines"` with `scopeSmooth` on |
+| `scopeSmoothing` | `1` | Passes of a small low-pass filter over the points, to steady the aliasing the original's point sampling leaves in. `0` is the original. Past about 4 it draws the envelope rather than the wave |
+| `scopeDotSize` | `5` | Dot size in px for `"dots"`, or `"cell"` to fill the whole cell as the original does. Also the gap control: the gap is the column spacing minus this |
+| `scopeDotShape` | `"round"` | `"round"` or `"square"`, for numeric dot sizes |
+| `scopeGain` | `1` | Vertical gain, hard-clipped at the pane edges. `1` is the original's scaling, which needs a track peaking near -6 dBFS to fill the pane; 3 to 4 suits quieter modern masters |
+
+The trace is coloured from the skin's oscilloscope ramp, brightest on the centre line.
+Under the `theme` and `monochrome` schemes it uses the ink colour at stepped opacities
+instead, so it still reads as an oscilloscope rather than taking on the data-series
+hues.
+
+`visRefresh` matters more here than for the analyzer. Consecutive frames are not
+phase-locked to each other, so at 60 a second the trace does not travel, it seethes.
+30, the default, gives each frame long enough to read as a shape. That is the
+original's own remedy.
+
+If the panel says `daemon sends no waveform`, the daemon was built before the
+oscilloscope existed (or is running with `--scope 0`). Rebuild it with
+`./lib/build.sh`.
+
 ## Options
 
-Widget options live at the top of [`index.coffee`](index.coffee): `layoutMode`,
+Widget options live at the top of [`index.coffee`](index.coffee): `visualization`,
+`layoutMode`,
 position and size, `colorScheme` (`winamp` / `theme` / `monochrome`) and `monoRange`,
 `colorStyle` (`normal` / `fire` / `line`), `background`, `bandWidth`, `rows`,
 `barGap`, `vizRadius`, `dbSpan`, `gain`, peak markers, the falloff speeds,
-`visRefresh`, the fade options, and the jitter-buffer latency cap.
+`visRefresh`, the oscilloscope options (see above), the fade options, and the
+jitter-buffer latency cap.
 
 `vizRadius` (3) rounds the analyzer area itself, which is the canvas inside the
 panel's 10px padding rather than the panel. It is a canvas clip, not CSS
@@ -496,6 +537,8 @@ Daemon options:
 --port <n>              WebSocket port (default: 41500)
 --fft <n>               FFT window, power of two (default: 2048)
 --bands <n>             frequency bands (default: 75, the classic band count)
+--scope <n>             oscilloscope points per frame, 0 leaves the waveform off
+                        the wire (default: 75)
 --simulate-stall <sec>  pull the tap that long after capture starts, to
                         exercise the watchdog
 --floor / --ceil <dB>   normalization window (default: -72 / -12)

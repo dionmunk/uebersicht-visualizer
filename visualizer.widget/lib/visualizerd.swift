@@ -39,6 +39,17 @@ struct Config {
     // real number here means thin mode shows genuine resolution rather than
     // interpolated filler.
     var bandCount = 75
+    // Points in the oscilloscope trace. 75 is the width in pixels of the classic
+    // Winamp vis pane, and its scope draws one sample per pixel column, so that is
+    // what a faithful trace wants. 0 drops the waveform from the wire entirely,
+    // which roughly halves the payload for a client that only draws the analyzer.
+    //
+    // Samples are point-sampled, not averaged. That is what the original does, and
+    // it is the reason the trace shows the bass envelope swinging rather than a
+    // solid block of hash: at 75 points across one hop, everything above about
+    // 3.4 kHz aliases. Averaging would be more correct and would not look like
+    // Winamp.
+    var scopePoints = 75
     var fftSize = 2048
     var minHz: Float = 32
     var maxHz: Float = 16_000
@@ -120,6 +131,8 @@ func parseArgs() -> Config {
             if let v = it.next(), let n = UInt16(v) { c.port = n }
         case "--bands", "-b":
             if let v = it.next(), let n = Int(v) { c.bandCount = max(4, min(128, n)) }
+        case "--scope":
+            if let v = it.next(), let n = Int(v) { c.scopePoints = max(0, min(256, n)) }
         case "--fft":
             // must stay a power of two for vDSP_fft_zrip
             if let v = it.next(), let n = Int(v), n > 0, (n & (n - 1)) == 0 { c.fftSize = n }
@@ -145,6 +158,8 @@ func parseArgs() -> Config {
               --device, -d <name>     input device to tap (default: Music)
               --port, -p <n>          WebSocket port (default: 41500)
               --bands, -b <n>         number of frequency bands (default: 32)
+              --scope <n>             oscilloscope points per frame, 0 disables
+                                      the waveform (default: 75)
               --fft <n>               FFT window, power of two (default: 2048)
               --floor <dB>            level mapped to 0 (default: -72)
               --ceil <dB>             level mapped to 1 (default: -12)
@@ -225,6 +240,11 @@ func findDevice(named wanted: String) -> Device? {
 struct SpectrumFrame {
     let bands: [Float]
     let rms: Float
+    /// The time-domain waveform behind this frame, point-sampled to
+    /// `Config.scopePoints` and encoded the way Web Audio's `getByteTimeDomainData`
+    /// encodes it: 0-255 with 128 as zero. Empty under `--scope 0`. Only the
+    /// oscilloscope draws it; the analyzer ignores it.
+    let wave: [UInt8]
 }
 
 final class Analyzer {
@@ -359,6 +379,10 @@ final class Analyzer {
         work.update(from: ring + ringPos, count: tail)
         (work + tail).update(from: ring, count: ringPos)
 
+        // Sampled here, off `work`, because the FFT path below reads from `windowed`
+        // and leaves `work` as the plain time-domain signal.
+        let wave = sampleScope()
+
         var sumSq: Float = 0
         vDSP_measqv(work, 1, &sumSq, vDSP_Length(fftSize))
         let frameRms = sqrt(sumSq)
@@ -394,7 +418,31 @@ final class Analyzer {
             let coeff = target > levels[b] ? cfg.attack : cfg.decay
             levels[b] += (target - levels[b]) * coeff
         }
-        return SpectrumFrame(bands: levels, rms: rms)
+        return SpectrumFrame(bands: levels, rms: rms, wave: wave)
+    }
+
+    /// Point-sample the newest `hop` samples of `work` into `cfg.scopePoints` bytes,
+    /// 128 being zero. Encoding and sampling both mirror the original, see
+    /// `Config.scopePoints`.
+    ///
+    /// The window is one hop rather than the whole FFT frame, because a hop is
+    /// exactly what this frame advanced by: consecutive frames then tile the
+    /// waveform end to end with no overlap and no gap. Sampling the full 2048-sample
+    /// window instead would re-send three quarters of the previous frame's audio and
+    /// the trace would crawl across the pane at a quarter speed.
+    private func sampleScope() -> [UInt8] {
+        let n = cfg.scopePoints
+        guard n > 0 else { return [] }
+        // `hop` can exceed `fftSize` at a tiny --fft, where hop floors at 256.
+        let take = min(hop, fftSize)
+        let base = fftSize - take
+        var out = [UInt8](repeating: 128, count: n)
+        for j in 0..<n {
+            let s = work[base + (j * take) / n]
+            let v = s.isFinite ? s : 0
+            out[j] = UInt8(max(0, min(255, (v * 128 + 128).rounded())))
+        }
+        return out
     }
 
     private func clamp01(_ v: Float) -> Float { min(max(v, 0), 1) }
@@ -823,6 +871,7 @@ if config.selfTest {
 
     var phase: Float = 0
     var levels: [Float] = []
+    var wave: [UInt8] = []
     let step = 2 * Float.pi * toneHz / sampleRate
     for _ in 0..<(Int(sampleRate) / chunk) {   // ~1 second, enough for smoothing to settle
         for i in 0..<chunk {
@@ -832,6 +881,7 @@ if config.selfTest {
         }
         if let last = analyzer.feed(buf, count: chunk, sampleRate: sampleRate).last {
             levels = last.bands
+            wave = last.wave
         }
     }
 
@@ -856,6 +906,18 @@ if config.selfTest {
     print("  peak band: \(peak.offset) "
           + "(\(Int(edges[peak.offset].lo))-\(Int(edges[peak.offset].hi)) Hz) "
           + "level \(String(format: "%.3f", peak.element))")
+    if !wave.isEmpty {
+        // A sine is the one signal whose trace can be checked by eye: at this rate a
+        // 1 kHz tone puts sampleRate / toneHz samples in a cycle, so one hop should
+        // show hop * toneHz / sampleRate of them across the pane.
+        let lo = wave.min() ?? 128, hi = wave.max() ?? 128
+        let rows = Array(" .:-=+*#%@")
+        let trace = wave.map { rows[Int(Float($0) / 256 * 10)] }
+        print("\n  scope: \(wave.count) points, \(lo)..\(hi) (128 = zero)")
+        print("  " + String(trace))
+        let cycles = Float(config.fftSize / 4) * toneHz / sampleRate
+        print(String(format: "  expect ~%.1f cycles of the tone across those points", cycles))
+    }
     print(inBand
           ? "\n  PASS: the tone landed in the band that contains \(Int(toneHz)) Hz"
           : "\n  FAIL: peak band does not contain \(Int(toneHz)) Hz")
@@ -889,7 +951,8 @@ server.greeting = {
     let dt = analyzer.frameIntervalMs
     let payload = """
     {"type":"meta","device":\(jsonString(device.name)),\
-    "bands":\(config.bandCount),"fft":\(config.fftSize),\
+    "bands":\(config.bandCount),"scope":\(config.scopePoints),\
+    "fft":\(config.fftSize),\
     "minHz":\(Int(config.minHz)),"maxHz":\(Int(config.maxHz)),\
     "dt":\(String(format: "%.2f", dt > 0 ? dt : 10.67))}
     """
@@ -908,7 +971,8 @@ func jsonString(_ s: String) -> String {
 /// 0-255 integers; the widget cannot resolve more precision than that anyway.
 func encode(frames: [SpectrumFrame], dtMs: Float) -> Data {
     var s = "{\"type\":\"f\",\"dt\":\(String(format: "%.2f", dtMs)),\"f\":["
-    s.reserveCapacity(frames.count * (frames.first?.bands.count ?? 32) * 4 + 64)
+    let perFrame = (frames.first?.bands.count ?? 32) + (frames.first?.wave.count ?? 0)
+    s.reserveCapacity(frames.count * perFrame * 4 + 64)
     for (i, frame) in frames.enumerated() {
         if i > 0 { s += "," }
         s += "["
@@ -923,7 +987,24 @@ func encode(frames: [SpectrumFrame], dtMs: Float) -> Data {
         if i > 0 { s += "," }
         s += String(Int(min(max(frame.rms, 0), 1) * 255))
     }
-    s += "]}"
+    s += "]"
+    // Omitted entirely under --scope 0 rather than sent as empty arrays, so a client
+    // can test for the key. Already 0-255 bytes centred on 128, so unlike the bands
+    // there is nothing to scale here.
+    if frames.first?.wave.isEmpty == false {
+        s += ",\"w\":["
+        for (i, frame) in frames.enumerated() {
+            if i > 0 { s += "," }
+            s += "["
+            for (j, v) in frame.wave.enumerated() {
+                if j > 0 { s += "," }
+                s += String(v)
+            }
+            s += "]"
+        }
+        s += "]"
+    }
+    s += "}"
     return s.data(using: .utf8) ?? Data()
 }
 
